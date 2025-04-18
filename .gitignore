@@ -54,3 +54,5 @@ temp/
 output/
 data/
 logs/
+.data/
+.key/
