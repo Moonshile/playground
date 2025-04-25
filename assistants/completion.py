@@ -8,7 +8,7 @@ import datetime
 
 with open('.key/cosmo.json', 'r') as f:
     key = json.load(f)
-    endpoint = key['endpoint']
+    endpoint = key['azure_endpoint']
     api_key = key['api_key']
     api_version = key['api_version']
 
@@ -40,12 +40,19 @@ def convert_to_content(content: str, img = False):
     }
 
 
-def generate(messages: list):
+def generate(messages: list, temperature: float = 0.2):
     response = client.chat.completions.create(
         model="gpt-4o-2024-08-06-cosmo",
-        messages=messages
+        messages=messages,
+        temperature=temperature,
     )
     return response
+
+
+def parse_gen_res(response: ChatCompletion):
+    if not response.choices:
+        return None
+    return response.choices[0].message.content
 
 
 def analyze_response(response: ChatCompletion):
@@ -62,10 +69,7 @@ def analyze_response(response: ChatCompletion):
         raise e
 
 
-def process(df: pd.DataFrame, prompt: str, save_file: str) -> list:
-    """
-    Convert DataFrame to a list of messages.
-    """
+def process(df: pd.DataFrame, prompt: str, save_file: str):
     prompt_message = {
         'role': 'developer',
         'content': prompt

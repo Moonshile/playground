@@ -6,7 +6,7 @@ import json
 
 with open('.key/test-batch.json', 'r') as f:
     key = json.load(f)
-    endpoint = key['endpoint']
+    endpoint = key['azure_endpoint']
     api_key = key['api_key']
     api_version = key['api_version']
 
