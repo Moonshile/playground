@@ -58,9 +58,12 @@ def process(df: pd.DataFrame, prompt: str, save_file: str):
         if len(resps) > 0 and len(resps) % 10 == 0:
             print(f"[{datetime.datetime.now()}] Saving responses to {save_file}...")
             pd.DataFrame(resps).to_csv(save_file, index=False)
+    pd.DataFrame(resps).to_csv(save_file, index=False)
 
 
 def generate_replys():
+    if os.path.exists('.data/edu_problems.res.csv'):
+        os.remove('.data/edu_problems.res.csv')
     prompt_filename = '.data/edu_problems.prompt.txt'
     with open(prompt_filename, 'r') as f:
         prompt = f.read()
@@ -73,6 +76,7 @@ def generate_one(idx: int):
     prompt_filename = '.data/edu_problems.prompt.txt'
     with open(prompt_filename, 'r') as f:
         prompt = f.read()
+    print(prompt)
     df = pd.read_csv('.data/edu_problems.csv', delimiter='\t')
     print(df.shape)
     row = df.iloc[idx]
@@ -81,11 +85,13 @@ def generate_one(idx: int):
         'role': 'developer',
         'content': prompt
     }
-    item = process_one(row, prompt_message)
-    if not item:
-        print('[ERROR] No response from model for message {contents}')
-        return
-    print(item['content'])
+    for i in range(10):
+        item = process_one(row, prompt_message)
+        if not item:
+            print('[ERROR] No response from model for message {contents}')
+            return
+        print(item['content'])
+        print(f'====================== {i} =====================')
 
 
 def value_of_key(v):
@@ -113,14 +119,13 @@ def fill_into_db(df: pd.DataFrame):
             value_of_key(row['type']),
             value_of_key(row['extra']))
         cursor.execute(sql, values)
-        conn.commit()
+    conn.commit()
     cursor.close()
     conn.close()
 
 
 if __name__ == "__main__":
-    # generate_replys()
-    generate_one(5)
-    # df = pd.read_csv('.data/edu_problems.res.csv')
-    # fill_into_db(df)
-
+    generate_replys()
+    df = pd.read_csv('.data/edu_problems.res.csv')
+    fill_into_db(df)
+    # generate_one(30)

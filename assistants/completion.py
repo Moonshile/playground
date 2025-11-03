@@ -19,11 +19,11 @@ client = AzureOpenAI(
   api_version=api_version
 )
 
-def read_csv(file_path):
+def read_csv(file_path, delimiter=','):
     """
     Read a CSV file and return a DataFrame.
     """
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, delimiter=delimiter)
     return df
 
 def convert_to_content(content: str, img = False):
@@ -82,13 +82,13 @@ def process(df: pd.DataFrame, prompt: str, save_file: str):
     for index, row in df.iterrows():
         if index < skip:
             continue
+        print(f"[{datetime.datetime.now()}] Processing row {index+1}/{df.shape[0]} {row}...")
         if not row['content'] and not row['extra']:
             continue
-        print(f"[{datetime.datetime.now()}] Processing row {index+1}/{df.shape[0]}...")
         contents = []
-        if row['content'] and not pd.isna(row['content']):
+        if row.get('content') and row['content'] and not pd.isna(row['content']):
             contents.append(convert_to_content(row['content']))
-        if row['extra'] and not pd.isna(row['extra']):
+        if row.get('extra') and row['extra'] and not pd.isna(row['extra']):
             extra = json.loads(row['extra'])
             if 'images' in extra:
                 for img in extra['images']:
@@ -98,10 +98,10 @@ def process(df: pd.DataFrame, prompt: str, save_file: str):
         resp = generate([prompt_message, {'role': 'user', 'content': contents}])
         intent = analyze_response(resp)
         if intent:
-            intent['userId'] = row['userId']
+            intent['userId'] = row.get('userId')
             intent['content'] = row['content']
-            intent['extra'] = row['extra']
-            intent['id'] = row['id']
+            intent['extra'] = row.get('extra')
+            intent['id'] = row.get('id')
             resps.append(intent)
             if len(resps) > 0 and len(resps) % 100 == 0:
                 pd.DataFrame(resps).to_csv(save_file, index=False)
@@ -118,7 +118,7 @@ def main():
         prompt = f.read()
     filename = sys.argv[2]
     # Read the CSV file
-    df = read_csv(filename)
+    df = read_csv(filename, delimiter='\t')
     # Process the DataFrame
     output_filename = f'{filename}.res.csv'
     process(df, prompt, output_filename)
