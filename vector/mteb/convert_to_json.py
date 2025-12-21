@@ -1,6 +1,21 @@
 """
 将 mteb 检索数据集转换为 JSON 文件
-输出格式：JSON 列表，每个元素包含 query 和 document 字段
+输出格式：JSON 列表，每个元素包含 query、document 和 score（可选）字段
+
+输出格式示例:
+[
+  {
+    "query": "查询文本",
+    "document": "文档文本",
+    "score": 1.0  // 可选，表示相关性分数：1.0=相关，0.0=不相关
+  }
+]
+
+Score字段说明:
+- score = 1.0: 表示该文档与查询相关（positive样本）
+- score = 0.0: 表示该文档与查询不相关（negative样本）
+- 如果数据集中只有positive样本，所有score都是1.0
+- 如果数据集中有negative样本，score会是0.0
 
 使用方法:
     # 使用默认的小数据集 (nfcorpus)
@@ -351,10 +366,11 @@ def is_likely_id(value: str) -> bool:
             return True
     return False
 
-def extract_query_and_document(example: Dict[str, Any], corpus: Optional[Dict[str, Any]], doc_id_map: Optional[Dict[str, str]] = None, queries: Optional[Dict[str, Any]] = None, query_id_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
-    """从样本中提取query和document（优化版本）"""
+def extract_query_and_document(example: Dict[str, Any], corpus: Optional[Dict[str, Any]], doc_id_map: Optional[Dict[str, str]] = None, queries: Optional[Dict[str, Any]] = None, query_id_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    """从样本中提取query、document和score（优化版本）"""
     query = None
     document = None
+    score = None
     query_id_value = None
 
     # 查找query字段
@@ -409,12 +425,86 @@ def extract_query_and_document(example: Dict[str, Any], corpus: Optional[Dict[st
                     elif is_likely_id(doc_id):
                         return None
 
+    # 查找score字段
+    # 优先级：1. 明确的score字段 2. positive/negative字段 3. relevance/rank/rating/label字段
+
+    # 首先检查是否有positive/negative字段（检索数据集常用）
+    has_positive = False
+    has_negative = False
+    for key, value in example.items():
+        key_lower = key.lower()
+        if 'positive' in key_lower and not 'negative' in key_lower:
+            has_positive = True
+            # 如果positive字段存在且是文档文本，说明这是正样本
+            if isinstance(value, str) and len(value) > 10:
+                score = 1.0
+                break
+        elif 'negative' in key_lower and not 'positive' in key_lower:
+            has_negative = True
+            # 如果negative字段存在且是文档文本，说明这是负样本
+            if isinstance(value, str) and len(value) > 10:
+                score = 0.0
+                break
+
+    # 如果没有通过positive/negative确定score，查找明确的score字段
+    if score is None:
+        for key, value in example.items():
+            key_lower = key.lower()
+            if 'score' in key_lower:
+                # score可能是数字或字符串
+                if isinstance(value, (int, float)):
+                    score = float(value)
+                elif isinstance(value, str):
+                    try:
+                        score = float(value)
+                    except (ValueError, TypeError):
+                        score = None
+                else:
+                    try:
+                        score = float(value)
+                    except (ValueError, TypeError):
+                        score = None
+                if score is not None:
+                    break
+
+    # 如果没有找到score字段，尝试查找其他可能的字段名
+    if score is None:
+        for key, value in example.items():
+            key_lower = key.lower()
+            # 可能的score相关字段名
+            if any(x in key_lower for x in ['relevance', 'rank', 'rating', 'label']):
+                if isinstance(value, (int, float)):
+                    score = float(value)
+                elif isinstance(value, str):
+                    try:
+                        score = float(value)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    try:
+                        score = float(value)
+                    except (ValueError, TypeError):
+                        pass
+                if score is not None:
+                    break
+
+    # 如果仍然没有找到score，但数据集中有positive字段，默认设为1.0（正样本）
+    # 如果有negative字段，默认设为0.0（负样本）
+    if score is None:
+        if has_positive:
+            score = 1.0
+        elif has_negative:
+            score = 0.0
+
     # 最终验证：确保query和document都不是ID
     if query and document:
         # 如果query或document看起来还是ID，跳过
         if is_likely_id(query) or is_likely_id(document):
             return None
-        return {"query": query, "document": document}
+        result = {"query": query, "document": document}
+        if score is not None:
+            result["score"] = score
+        return result
     return None
 
 def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "train", use_cache: bool = True, reset_cache: bool = False) -> Dict[str, Any]:
@@ -526,6 +616,8 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
     validation_issues = []
     id_like_queries = []
     id_like_docs = []
+    items_with_score = 0
+    items_without_score = 0
 
     for idx, item in enumerate(json_data):
         query = item.get("query", "")
@@ -545,6 +637,12 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
                 "document": document[:50] if len(document) > 50 else document
             })
 
+        # 统计score字段
+        if "score" in item:
+            items_with_score += 1
+        else:
+            items_without_score += 1
+
     # 报告验证结果
     if id_like_queries or id_like_docs:
         print(f"⚠️  警告：发现可能未转换的ID")
@@ -562,15 +660,42 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
         validation_issues = {
             "query_ids": len(id_like_queries),
             "document_ids": len(id_like_docs),
-            "total_issues": len(id_like_queries) + len(id_like_docs)
+            "total_issues": len(id_like_queries) + len(id_like_docs),
+            "items_with_score": items_with_score,
+            "items_without_score": items_without_score
         }
     else:
         print("✅ 验证通过：所有ID都已转换为实际文本")
         validation_issues = {
             "query_ids": 0,
             "document_ids": 0,
-            "total_issues": 0
+            "total_issues": 0,
+            "items_with_score": items_with_score,
+            "items_without_score": items_without_score
         }
+
+    # 报告score字段统计
+    if items_with_score > 0:
+        print(f"📊 Score字段统计:")
+        print(f"  - 包含score的样本: {items_with_score} ({items_with_score/len(json_data)*100:.1f}%)")
+        if items_without_score > 0:
+            print(f"  - 不包含score的样本: {items_without_score} ({items_without_score/len(json_data)*100:.1f}%)")
+
+        # 统计score值的分布
+        score_values = {}
+        for item in json_data:
+            if "score" in item:
+                s = item["score"]
+                score_values[s] = score_values.get(s, 0) + 1
+
+        if score_values:
+            print(f"  - Score值分布:")
+            for s, count in sorted(score_values.items(), reverse=True):
+                percentage = count / items_with_score * 100
+                meaning = "相关" if s == 1.0 else ("不相关" if s == 0.0 else "其他")
+                print(f"    score={s}: {count} 个样本 ({percentage:.1f}%) - {meaning}")
+    else:
+        print(f"⚠️  注意：数据集中未找到score字段")
 
     # 保存JSON文件
     print(f"\n正在保存JSON文件...")
@@ -591,12 +716,22 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
         "validation": validation_issues
     }
 
-    # 计算平均长度
+    # 计算平均长度和score统计
     if json_data:
         avg_query_len = sum(len(item["query"]) for item in json_data) / len(json_data)
         avg_doc_len = sum(len(item["document"]) for item in json_data) / len(json_data)
         stats["avg_query_length"] = round(avg_query_len, 2)
         stats["avg_document_length"] = round(avg_doc_len, 2)
+
+        # 计算score统计（如果存在）
+        scores = [item.get("score") for item in json_data if "score" in item and item["score"] is not None]
+        if scores:
+            stats["score_stats"] = {
+                "count": len(scores),
+                "min": round(min(scores), 4),
+                "max": round(max(scores), 4),
+                "avg": round(sum(scores) / len(scores), 4)
+            }
 
     return stats
 
@@ -677,6 +812,13 @@ if __name__ == "__main__":
         if 'avg_query_length' in stats:
             print(f"平均查询长度: {stats['avg_query_length']} 字符")
             print(f"平均文档长度: {stats['avg_document_length']} 字符")
+        if 'score_stats' in stats:
+            score_stats = stats['score_stats']
+            print(f"\nScore统计:")
+            print(f"  包含score的样本数: {score_stats['count']}")
+            print(f"  最小值: {score_stats['min']}")
+            print(f"  最大值: {score_stats['max']}")
+            print(f"  平均值: {score_stats['avg']}")
         print(f"输出文件: {stats['output_file']}")
         print(f"文件大小: {stats['file_size_mb']:.2f} MB")
         if 'validation' in stats:
