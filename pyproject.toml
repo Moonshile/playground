@@ -7,5 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.4.2",
     "mteb>=2.4.2",
+    "openai>=2.14.0",
     "requests>=2.32.5",
 ]
