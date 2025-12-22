@@ -1,41 +1,46 @@
 """
-使用 OpenAI Embeddings API 将文本转换为向量
-支持标准 API 和 Batch API，包含性能统计和费用计算
+使用 Google Gemini Embeddings API 将文本转换为向量
+使用 gemini-embedding-001 模型，包含性能统计和费用计算
 
 使用方法:
-    python vector/vectorize/openai_test.py -i input.json -o output.json
-    python vector/vectorize/openai_test.py -i input.json -o output.json -m text-embedding-3-large -b 50 -r 10
+    python vector/vectorize/gemini_text_test.py -i input.json -o output.json
+    python vector/vectorize/gemini_text_test.py -i input.json -o output.json -b 50 -r 10
 """
 import os
 import json
 import time
 import argparse
 from typing import List, Optional, Dict, Any, Tuple
-from openai import OpenAI
+import google.generativeai as genai
 
 # ==================== 配置 ====================
 
-# OpenAI Embeddings 模型定价（每百万tokens，美元）
+# Gemini Embeddings 模型定价（每百万tokens，美元）
 EMBEDDING_PRICING = {
-    "text-embedding-3-small": 0.02,  # $0.02 per 1M tokens
-    "text-embedding-3-large": 0.13,  # $0.13 per 1M tokens
-    "text-embedding-ada-002": 0.10,  # $0.10 per 1M tokens (旧模型)
+    "models/gemini-embedding-001": 0.15,  # $0.15 per 1M tokens
+    "gemini-embedding-001": 0.15,  # 简化名称
 }
 
 
 # ==================== 工具函数 ====================
 
-def get_openai_client() -> OpenAI:
-    """获取 OpenAI 客户端，从环境变量读取 API key"""
-    api_key = os.getenv("OPENAI_API_KEY")
+def get_gemini_client():
+    """获取 Gemini 客户端，从环境变量读取 API key"""
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("请设置 OPENAI_API_KEY 环境变量")
-    return OpenAI(api_key=api_key)
+        raise ValueError("请设置 GEMINI_API_KEY 环境变量")
+    genai.configure(api_key=api_key)
+    return genai
 
 
 def get_model_pricing(model: str) -> float:
     """获取模型的定价（每百万tokens，美元）"""
-    return EMBEDDING_PRICING.get(model, 0.02)  # 默认使用text-embedding-3-small的定价
+    # 标准化模型名称
+    if model.startswith("models/"):
+        model_key = model
+    else:
+        model_key = f"models/{model}"
+    return EMBEDDING_PRICING.get(model_key, EMBEDDING_PRICING.get(model, 0.15))
 
 
 def calculate_cost(tokens: int, model: str) -> float:
@@ -57,51 +62,66 @@ def calculate_cost(tokens: int, model: str) -> float:
 
 def vectorize_text(
     text: str,
-    model: str = "text-embedding-3-small",
-    client: Optional[OpenAI] = None
+    model: str = "models/gemini-embedding-001",
+    client=None
 ) -> List[float]:
     """
-    使用 OpenAI Embeddings API 将单个文本转换为向量
+    使用 Gemini Embeddings API 将单个文本转换为向量
 
     Args:
         text: 要转换的文本
-        model: 使用的模型，默认为 "text-embedding-3-small"
-        client: OpenAI 客户端，如果为 None 则从环境变量创建
+        model: 使用的模型，默认为 "models/gemini-embedding-001"
+        client: Gemini 客户端，如果为 None 则从环境变量创建
 
     Returns:
         向量列表（浮点数列表）
     """
     if client is None:
-        client = get_openai_client()
+        client = get_gemini_client()
 
     if not text or not text.strip():
         raise ValueError("文本不能为空")
 
-    response = client.embeddings.create(model=model, input=text)
-    return response.data[0].embedding
+    # 标准化模型名称
+    if not model.startswith("models/"):
+        model = f"models/{model}"
+
+    result = genai.embed_content(
+        model=model,
+        content=text
+    )
+
+    # Gemini API 返回的格式
+    if hasattr(result, 'embedding'):
+        return result.embedding
+    elif isinstance(result, dict) and 'embedding' in result:
+        return result['embedding']
+    else:
+        # 如果返回的是列表，直接返回
+        return result
 
 
 def vectorize_texts_batch(
     texts: List[str],
-    model: str = "text-embedding-3-small",
-    client: Optional[OpenAI] = None,
+    model: str = "models/gemini-embedding-001",
+    client=None,
     batch_size: int = 100
 ) -> Tuple[List[List[float]], float, Dict[str, int]]:
     """
-    使用 OpenAI Embeddings API 批量将文本转换为向量
+    使用 Gemini Embeddings API 批量将文本转换为向量
 
     Args:
         texts: 要转换的文本列表
-        model: 使用的模型，默认为 "text-embedding-3-small"
-        client: OpenAI 客户端，如果为 None 则从环境变量创建
-        batch_size: 每次请求的批量大小（OpenAI API 支持最多 2048 个输入）
+        model: 使用的模型，默认为 "models/gemini-embedding-001"
+        client: Gemini 客户端，如果为 None 则从环境变量创建
+        batch_size: 每次请求的批量大小（Gemini API 支持批量处理）
 
     Returns:
         (向量列表, API调用总时间（秒）, token使用信息字典)
         token使用信息包含: prompt_tokens, total_tokens
     """
     if client is None:
-        client = get_openai_client()
+        client = get_gemini_client()
 
     if not texts:
         return [], 0.0, {"prompt_tokens": 0, "total_tokens": 0}
@@ -110,6 +130,10 @@ def vectorize_texts_batch(
     valid_texts = [(i, text) for i, text in enumerate(texts) if text and text.strip()]
     if not valid_texts:
         raise ValueError("没有有效的文本")
+
+    # 标准化模型名称
+    if not model.startswith("models/"):
+        model = f"models/{model}"
 
     all_vectors = [None] * len(texts)
     total_api_time = 0.0
@@ -124,19 +148,49 @@ def vectorize_texts_batch(
 
         # 只记录API调用时间
         api_start = time.time()
-        response = client.embeddings.create(model=model, input=batch_texts)
-        api_end = time.time()
-        api_time = api_end - api_start
-        total_api_time += api_time
+        try:
+            # Gemini API 支持批量处理
+            result = genai.embed_content(
+                model=model,
+                content=batch_texts
+            )
+            api_end = time.time()
+            api_time = api_end - api_start
+            total_api_time += api_time
 
-        # 提取token使用信息
-        if hasattr(response, 'usage') and response.usage:
-            total_prompt_tokens += response.usage.prompt_tokens
-            total_tokens += response.usage.total_tokens
+            # 提取向量结果
+            # Gemini API 返回格式可能是列表或字典
+            if isinstance(result, dict):
+                embeddings = result.get('embeddings', [])
+            elif hasattr(result, 'embeddings'):
+                embeddings = result.embeddings
+            else:
+                embeddings = result if isinstance(result, list) else [result]
 
-        # 将结果放回原位置
-        for idx, embedding in zip(batch_indices, response.data):
-            all_vectors[idx] = embedding.embedding
+            # 将结果放回原位置
+            for idx, embedding in zip(batch_indices, embeddings):
+                if isinstance(embedding, dict) and 'values' in embedding:
+                    all_vectors[idx] = embedding['values']
+                elif isinstance(embedding, list):
+                    all_vectors[idx] = embedding
+                elif hasattr(embedding, 'values'):
+                    all_vectors[idx] = embedding.values
+                else:
+                    all_vectors[idx] = embedding
+
+            # 提取token使用信息（如果可用）
+            # 注意：Gemini API 可能不直接返回token信息，需要估算
+            # 这里我们使用一个简单的估算：每个字符约等于0.25个token
+            for text in batch_texts:
+                estimated_tokens = int(len(text) * 0.25)
+                total_prompt_tokens += estimated_tokens
+                total_tokens += estimated_tokens
+
+        except Exception as e:
+            api_end = time.time()
+            api_time = api_end - api_start
+            total_api_time += api_time
+            raise RuntimeError(f"Gemini API 调用失败: {e}") from e
 
     return all_vectors, total_api_time, {
         "prompt_tokens": total_prompt_tokens,
@@ -345,7 +399,7 @@ def process_batch(
     text_type: str,
     batch_index: int,
     model: str,
-    client: OpenAI,
+    client,
     batch_size: int,
     processed_count: int,
     total_count: int,
@@ -433,7 +487,7 @@ def save_checkpoint_with_results(
 def process_qa_data(
     input_file: str,
     output_file: str,
-    model: str = "text-embedding-3-small",
+    model: str = "models/gemini-embedding-001",
     batch_size: int = 100,
     from_scratch: bool = False,
     report_interval: int = 5,
@@ -452,7 +506,7 @@ def process_qa_data(
         max_items: 最大处理条数（None表示处理所有数据）
     """
     print("=" * 60)
-    print("处理QA数据 - 生成向量")
+    print("处理QA数据 - 生成向量 (Gemini)")
     print("=" * 60)
     print(f"输入文件: {input_file}")
     print(f"输出文件: {output_file}")
@@ -502,7 +556,7 @@ def process_qa_data(
             print(f"   累计费用: ${cumulative_stats.get('total_cost', 0):.4f}")
 
     # 获取客户端
-    client = get_openai_client()
+    client = get_gemini_client()
 
     # 处理剩余的数据
     query_remaining_data = data[query_processed_count:]
@@ -741,18 +795,25 @@ def process_qa_data(
     print(f"✅ Document向量处理完成，总API调用时间: {doc_api_time_total:.2f}s, "
           f"总Token: {doc_total_tokens:,}\n")
 
-    # 验证结果完整性
-    if len(results) != len(data):
-        print(f"⚠️  警告: 结果数量 ({len(results)}) 与数据数量 ({len(data)}) 不匹配")
-        # 补齐缺失的结果
-        for i in range(len(results), len(data)):
+    # 确保所有结果都有query向量（从缓存中获取）
+    for i in range(len(data)):
+        if i >= len(results):
             results.append({
                 "query": data[i].get("query", ""),
                 "document": data[i].get("document", ""),
-                "query_vector": None,
+                "query_vector": query_vector_cache.get(data[i].get("query", "")),
                 "document_vector": None,
                 "score": data[i].get("score")
             })
+        elif results[i].get("query_vector") is None:
+            # 从缓存中获取query向量
+            query_text = data[i].get("query", "")
+            if query_text in query_vector_cache:
+                results[i]["query_vector"] = query_vector_cache[query_text]
+
+    # 验证结果完整性
+    if len(results) != len(data):
+        print(f"⚠️  警告: 结果数量 ({len(results)}) 与数据数量 ({len(data)}) 不匹配")
 
     # 计算总体性能统计
     total_api_time = query_api_time_total + doc_api_time_total
@@ -851,24 +912,24 @@ def process_qa_data(
 def main():
     """主函数，解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="为QA数据生成向量（query和document）",
+        description="为QA数据生成向量（query和document）- 使用 Gemini API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   # 基本使用
-  python vector/vectorize/openai_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors.json
+  python vector/vectorize/gemini_text_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors_gemini.json
 
-  # 指定模型和批量大小
-  python vector/vectorize/openai_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors.json -m text-embedding-3-large -b 50
+  # 指定批量大小
+  python vector/vectorize/gemini_text_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors_gemini.json -b 50
 
   # 从头开始处理（忽略已有检查点）
-  python vector/vectorize/openai_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors.json --restart
+  python vector/vectorize/gemini_text_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors_gemini.json --restart
 
   # 调整性能报告间隔
-  python vector/vectorize/openai_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors.json -r 10
+  python vector/vectorize/gemini_text_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors_gemini.json -r 10
 
   # 限制处理条数（用于测试）
-  python vector/vectorize/openai_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors.json --max-items 100
+  python vector/vectorize/gemini_text_test.py -i .data/mteb/nfcorpus.json -o .data/vectors/nfcorpus_vectors_gemini.json --max-items 100
         """
     )
 
@@ -886,8 +947,8 @@ def main():
 
     parser.add_argument(
         '-m', '--model',
-        default='text-embedding-3-small',
-        help='使用的模型（默认: text-embedding-3-small）'
+        default='models/gemini-embedding-001',
+        help='使用的模型（默认: models/gemini-embedding-001）'
     )
 
     parser.add_argument(
@@ -950,3 +1011,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
