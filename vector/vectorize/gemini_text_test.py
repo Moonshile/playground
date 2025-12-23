@@ -1,17 +1,18 @@
 """
 使用 Google Gemini Embeddings API 将文本转换为向量
-使用 gemini-embedding-001 模型，包含性能统计和费用计算
+支持 gemini-embedding-001 模型，包含性能统计和费用计算
 
 使用方法:
     python vector/vectorize/gemini_text_test.py -i input.json -o output.json
-    python vector/vectorize/gemini_text_test.py -i input.json -o output.json -b 50 -r 10
+    python vector/vectorize/gemini_text_test.py -i input.json -o output.json -m models/gemini-embedding-001 -b 50 -r 10
 """
 import os
 import json
 import time
 import argparse
 from typing import List, Optional, Dict, Any, Tuple
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ==================== 配置 ====================
 
@@ -24,13 +25,13 @@ EMBEDDING_PRICING = {
 
 # ==================== 工具函数 ====================
 
-def get_gemini_client():
+def get_gemini_client() -> genai.Client:
     """获取 Gemini 客户端，从环境变量读取 API key"""
-    api_key = os.getenv("GEMINI_API_KEY")
+    # 优先使用 GOOGLE_API_KEY，如果没有则尝试 GEMINI_API_KEY（向后兼容）
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("请设置 GEMINI_API_KEY 环境变量")
-    genai.configure(api_key=api_key)
-    return genai
+        raise ValueError("请设置 GOOGLE_API_KEY 或 GEMINI_API_KEY 环境变量")
+    return genai.Client(api_key=api_key)
 
 
 def get_model_pricing(model: str) -> float:
@@ -63,7 +64,7 @@ def calculate_cost(tokens: int, model: str) -> float:
 def vectorize_text(
     text: str,
     model: str = "models/gemini-embedding-001",
-    client=None
+    client: Optional[genai.Client] = None
 ) -> List[float]:
     """
     使用 Gemini Embeddings API 将单个文本转换为向量
@@ -86,25 +87,20 @@ def vectorize_text(
     if not model.startswith("models/"):
         model = f"models/{model}"
 
-    result = genai.embed_content(
+    result = client.models.embed_content(
         model=model,
-        content=text
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=1536)
     )
-
-    # Gemini API 返回的格式
-    if hasattr(result, 'embedding'):
-        return result.embedding
-    elif isinstance(result, dict) and 'embedding' in result:
-        return result['embedding']
-    else:
-        # 如果返回的是列表，直接返回
-        return result
+    # 提取 embedding 对象中的 values
+    [embedding_obj] = result.embeddings
+    return embedding_obj.values
 
 
 def vectorize_texts_batch(
     texts: List[str],
     model: str = "models/gemini-embedding-001",
-    client=None,
+    client: Optional[genai.Client] = None,
     batch_size: int = 100
 ) -> Tuple[List[List[float]], float, Dict[str, int]]:
     """
@@ -150,33 +146,22 @@ def vectorize_texts_batch(
         api_start = time.time()
         try:
             # Gemini API 支持批量处理
-            result = genai.embed_content(
+            result = client.models.embed_content(
                 model=model,
-                content=batch_texts
+                contents=batch_texts,
+                config=types.EmbedContentConfig(output_dimensionality=1536)
             )
             api_end = time.time()
             api_time = api_end - api_start
             total_api_time += api_time
 
             # 提取向量结果
-            # Gemini API 返回格式可能是列表或字典
-            if isinstance(result, dict):
-                embeddings = result.get('embeddings', [])
-            elif hasattr(result, 'embeddings'):
-                embeddings = result.embeddings
-            else:
-                embeddings = result if isinstance(result, list) else [result]
+            # Gemini API 返回格式：result.embeddings 是一个列表，每个元素是 Embedding 对象，有 values 属性
+            embeddings = result.embeddings
 
             # 将结果放回原位置
             for idx, embedding in zip(batch_indices, embeddings):
-                if isinstance(embedding, dict) and 'values' in embedding:
-                    all_vectors[idx] = embedding['values']
-                elif isinstance(embedding, list):
-                    all_vectors[idx] = embedding
-                elif hasattr(embedding, 'values'):
-                    all_vectors[idx] = embedding.values
-                else:
-                    all_vectors[idx] = embedding
+                all_vectors[idx] = embedding.values
 
             # 提取token使用信息（如果可用）
             # 注意：Gemini API 可能不直接返回token信息，需要估算
@@ -399,7 +384,7 @@ def process_batch(
     text_type: str,
     batch_index: int,
     model: str,
-    client,
+    client: genai.Client,
     batch_size: int,
     processed_count: int,
     total_count: int,
@@ -912,7 +897,7 @@ def process_qa_data(
 def main():
     """主函数，解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="为QA数据生成向量（query和document）- 使用 Gemini API",
+        description="为QA数据生成向量（query和document）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
