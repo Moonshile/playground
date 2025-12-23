@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.4.2",
+    "google-cloud-aiplatform>=1.132.0",
     "google-genai>=1.56.0",
     "mteb>=2.4.2",
     "openai>=2.14.0",
