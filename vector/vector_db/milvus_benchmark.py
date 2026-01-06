@@ -52,12 +52,8 @@ def get_milvus_client():
     return connections.get_connection_addr("default")
 
 
-def compute_sha2048(text: str) -> str:
-    """
-    计算文本的SHA-2048哈希值
-    注意：SHA-2048实际上是指SHA-512算法（产生512位=64字节的哈希值）
-    这里使用SHA-512算法
-    """
+def compute_sha512_hex(text: str) -> str:
+    """计算文本的SHA-512哈希值（十六进制字符串）"""
     return hashlib.sha512(text.encode('utf-8')).hexdigest()
 
 
@@ -204,7 +200,7 @@ def extract_query_document_vectors_new_format(
                 query_seen.add(query_text)
 
             if doc_text:
-                doc_hash = compute_sha2048(doc_text)
+                doc_hash = compute_sha512_hex(doc_text)
                 if doc_hash not in doc_seen:
                     document_list.append(doc_text)
                     doc_seen.add(doc_hash)
@@ -239,7 +235,7 @@ def extract_query_document_vectors_new_format(
     # 匹配document向量（按顺序）
     for i, doc_text in enumerate(document_list):
         if i < len(document_vectors):
-            doc_hash = compute_sha2048(doc_text)
+            doc_hash = compute_sha512_hex(doc_text)
             documents.append({
                 'document': doc_text,
                 'vector': document_vectors[i],
@@ -278,7 +274,7 @@ def extract_query_document_vectors(
 
         if 'document_vector' in item and item['document_vector'] is not None:
             doc_text = item.get('document', '')
-            doc_hash = compute_sha2048(doc_text)
+            doc_hash = compute_sha512_hex(doc_text)
             documents.append({
                 'document': doc_text,
                 'vector': item['document_vector'],
@@ -338,7 +334,7 @@ def extract_query_document_vectors(
 
             # 匹配document向量
             if doc_text and doc_text in text_to_vector and doc_text not in doc_texts_seen:
-                doc_hash = compute_sha2048(doc_text)
+                doc_hash = compute_sha512_hex(doc_text)
                 documents.append({
                     'document': doc_text,
                     'vector': text_to_vector[doc_text],
@@ -368,22 +364,54 @@ def extract_query_document_vectors(
 
 # ==================== Milvus操作 ====================
 
-def create_collection(collection_name: str, dimension: int) -> Collection:
+def create_collection(collection_name: str, dimension: int, force_recreate: bool = False) -> Tuple[Collection, bool]:
     """
-    创建Milvus collection
+    创建或获取Milvus collection
 
     Args:
         collection_name: collection名称
         dimension: 向量维度
+        force_recreate: 是否强制重新创建（删除已存在的collection）
 
     Returns:
-        Collection对象
+        (Collection对象, 是否是新创建的)
     """
     # 检查collection是否已存在
     if utility.has_collection(collection_name):
-        print(f"⚠️  Collection '{collection_name}' 已存在，删除旧collection...")
-        collection = Collection(collection_name)
-        collection.drop()
+        if force_recreate:
+            print(f"⚠️  Collection '{collection_name}' 已存在，强制删除旧collection...")
+            collection = Collection(collection_name)
+            collection.drop()
+        else:
+            print(f"✅ Collection '{collection_name}' 已存在，复用现有collection")
+            collection = Collection(collection_name)
+            # 检查collection是否有索引
+            try:
+                indexes = collection.indexes
+                if not indexes:
+                    print(f"   正在创建索引...")
+                    index_params = {
+                        "metric_type": "COSINE",
+                        "index_type": "IVF_FLAT",
+                        "params": {"nlist": 1024}
+                    }
+                    collection.create_index("vector", index_params)
+            except Exception:
+                # 如果检查索引失败，尝试创建
+                print(f"   正在创建索引...")
+                index_params = {
+                    "metric_type": "COSINE",
+                    "index_type": "IVF_FLAT",
+                    "params": {"nlist": 1024}
+                }
+                collection.create_index("vector", index_params)
+
+            # 确保collection已加载到内存
+            try:
+                collection.load()
+            except Exception:
+                pass  # 如果已加载会抛出异常，忽略
+            return collection, False
 
     # 定义schema
     fields = [
@@ -408,10 +436,30 @@ def create_collection(collection_name: str, dimension: int) -> Collection:
     print(f"   维度: {dimension}")
     print(f"   索引类型: IVF_FLAT")
 
-    return collection
+    return collection, True
 
 
-def insert_documents(collection: Collection, documents: List[Dict[str, Any]], batch_size: int = 1000):
+def check_collection_data(collection: Collection, expected_count: int) -> bool:
+    """
+    检查collection中的数据量是否匹配预期
+
+    Args:
+        collection: Milvus collection对象
+        expected_count: 预期的数据量
+
+    Returns:
+        是否匹配
+    """
+    try:
+        # 获取collection的实体数量
+        num_entities = collection.num_entities
+        return num_entities == expected_count
+    except Exception as e:
+        print(f"   ⚠️  检查collection数据量时出错: {e}")
+        return False
+
+
+def insert_documents(collection: Collection, documents: List[Dict[str, Any]], batch_size: int = 1000, skip_if_exists: bool = True):
     """
     插入document向量到Milvus
 
@@ -419,7 +467,20 @@ def insert_documents(collection: Collection, documents: List[Dict[str, Any]], ba
         collection: Milvus collection对象
         documents: document列表，每个包含hash和vector
         batch_size: 批量插入大小
+        skip_if_exists: 如果collection中已有数据，是否跳过插入
     """
+    # 检查是否已有数据
+    if skip_if_exists:
+        expected_count = len(documents)
+        if check_collection_data(collection, expected_count):
+            print(f"✅ Collection中已有 {expected_count} 条数据，跳过插入")
+            # 确保collection已加载到内存
+            try:
+                collection.load()
+            except Exception:
+                pass  # 如果已加载会抛出异常，忽略
+            return
+
     print(f"📥 开始插入 {len(documents)} 个document向量...")
 
     primary_keys = [doc['hash'] for doc in documents]
@@ -537,6 +598,37 @@ def calculate_time_statistics(times: List[float]) -> Dict[str, float]:
 
 # ==================== 主评测流程 ====================
 
+def find_benchmark_file(vector_file: str) -> Optional[str]:
+    """
+    查找基准文件（优先从.data/vector_search目录）
+
+    Args:
+        vector_file: 向量数据文件路径
+
+    Returns:
+        基准文件路径，如果找不到则返回None
+    """
+    # 从向量文件名生成基准文件名
+    base_name = os.path.basename(vector_file)
+    benchmark_name = base_name.replace('.json', '_brute_force_benchmark.json')
+
+    # 优先查找路径（按优先级）
+    possible_paths = [
+        # 1. .data/vector_search目录（优先）
+        os.path.join('.data', 'vector_search', benchmark_name),
+        # 2. 与向量文件同目录
+        vector_file.replace('.json', '_brute_force_benchmark.json'),
+        # 3. 向量文件所在目录
+        os.path.join(os.path.dirname(vector_file), benchmark_name),
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
 def load_ground_truth(ground_truth_file: str) -> Optional[List[List[str]]]:
     """加载预计算的基准结果"""
     if not os.path.exists(ground_truth_file):
@@ -549,6 +641,10 @@ def load_ground_truth(ground_truth_file: str) -> Optional[List[List[str]]]:
     ground_truth = data.get('ground_truth', [])
     if ground_truth:
         print(f"✅ 已加载 {len(ground_truth)} 个query的基准结果")
+        # 验证基准文件信息
+        benchmark_top_n = data.get('top_n', 0)
+        benchmark_query_count = data.get('query_count', 0)
+        print(f"   基准信息: top_n={benchmark_top_n}, query_count={benchmark_query_count}")
         return ground_truth
 
     return None
@@ -558,7 +654,8 @@ def run_benchmark(
     vector_file: str,
     top_n: int = 10,
     collection_name: Optional[str] = None,
-    ground_truth_file: Optional[str] = None
+    ground_truth_file: Optional[str] = None,
+    force_recreate: bool = False
 ):
     """
     运行Milvus评测
@@ -646,53 +743,71 @@ def run_benchmark(
 
     # 获取向量维度
     dimension = len(documents[0]['vector'])
-    collection = create_collection(collection_name, dimension)
+    collection, is_new_collection = create_collection(collection_name, dimension, force_recreate)
 
-    # 4. 插入所有document向量
+    # 4. 插入所有document向量（如果是新collection或强制重建，则插入；否则检查是否已有数据）
     print("\n" + "=" * 80)
     print("📥 插入Document向量...")
-    insert_documents(collection, documents)
+    insert_documents(collection, documents, skip_if_exists=not force_recreate)
 
-    # 5. 计算或加载基准（暴力法）
+    # 5. 加载基准（优先从.data/vector_search目录）
     print("\n" + "=" * 80)
-    print("🔍 计算基准（暴力法）...")
+    print("🔍 加载基准结果...")
 
     ground_truth = None
+    benchmark_file_used = None
 
-    # 尝试加载预计算的基准
+    # 优先使用用户指定的基准文件
     if ground_truth_file:
-        ground_truth = load_ground_truth(ground_truth_file)
+        if os.path.exists(ground_truth_file):
+            ground_truth = load_ground_truth(ground_truth_file)
+            benchmark_file_used = ground_truth_file
+        else:
+            print(f"⚠️  指定的基准文件不存在: {ground_truth_file}")
 
-    # 如果没有提供基准文件，尝试自动查找
+    # 如果没有指定或文件不存在，自动查找基准文件
     if ground_truth is None:
-        possible_benchmark_file = vector_file.replace('.json', '_brute_force_benchmark.json')
-        if os.path.exists(possible_benchmark_file):
-            print(f"📖 发现基准文件: {possible_benchmark_file}")
-            ground_truth = load_ground_truth(possible_benchmark_file)
+        benchmark_file = find_benchmark_file(vector_file)
+        if benchmark_file:
+            print(f"📖 自动发现基准文件: {benchmark_file}")
+            ground_truth = load_ground_truth(benchmark_file)
+            benchmark_file_used = benchmark_file
 
-    # 如果仍然没有基准，则计算
+    # 如果仍然没有基准，报错（不再自动计算）
     if ground_truth is None:
-        print(f"   正在为 {len(queries)} 个query计算top-{top_n}基准...")
+        print(f"❌ 未找到基准文件，无法进行评测")
+        print(f"   请先运行 brute_force_benchmark.py 生成基准文件")
+        print(f"   或使用 -g 参数指定基准文件路径")
+        print(f"   预期基准文件位置:")
+        print(f"     - .data/vector_search/{os.path.basename(vector_file).replace('.json', '_brute_force_benchmark.json')}")
+        print(f"     - {vector_file.replace('.json', '_brute_force_benchmark.json')}")
+        return
 
-        doc_vectors = [doc['vector'] for doc in documents]
-        doc_ids = [doc['hash'] for doc in documents]
+    # 验证基准文件信息
+    if benchmark_file_used:
+        with open(benchmark_file_used, 'r', encoding='utf-8') as f:
+            benchmark_data = json.load(f)
+        benchmark_top_n = benchmark_data.get('top_n', 0)
+        benchmark_query_count = benchmark_data.get('query_count', 0)
 
-        ground_truth = []
-        for i, query in enumerate(queries):
-            if (i + 1) % 100 == 0:
-                print(f"   进度: {i + 1}/{len(queries)}", end='\r')
+        # 验证top_n是否匹配
+        if benchmark_top_n != top_n:
+            print(f"⚠️  警告: 基准文件的top_n ({benchmark_top_n}) 与指定的top_n ({top_n}) 不匹配")
+            print(f"   将使用基准文件的top_n: {benchmark_top_n}")
+            top_n = benchmark_top_n
 
-            query_vec = query['vector']
-            top_n_results = brute_force_top_n(query_vec, doc_vectors, doc_ids, top_n)
-            ground_truth.append([doc_id for doc_id, _ in top_n_results])
-
-        print(f"\n✅ 基准计算完成")
-    else:
-        # 验证基准数量是否匹配
+        # 验证query数量是否匹配
         if len(ground_truth) != len(queries):
             print(f"⚠️  警告: 基准结果数量 ({len(ground_truth)}) 与query数量 ({len(queries)}) 不匹配")
-            print(f"   将使用前 {min(len(ground_truth), len(queries))} 个结果")
-            ground_truth = ground_truth[:len(queries)]
+            if len(ground_truth) < len(queries):
+                print(f"   基准结果不足，无法完成评测")
+                return
+            else:
+                print(f"   将使用前 {len(queries)} 个结果")
+                ground_truth = ground_truth[:len(queries)]
+
+    print(f"✅ 基准加载完成，使用文件: {benchmark_file_used}")
+    print(f"   Top-N: {top_n}, Query数量: {len(queries)}")
 
     # 6. 执行检索评测
     print("\n" + "=" * 80)
@@ -795,17 +910,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 基本使用（会自动计算基准）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/nfcorpus_openai_vectors.json
+  # 基本使用（自动从.data/vector_search目录加载基准文件）
+  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json
 
-  # 使用预计算的基准文件（推荐：先运行brute_force_benchmark.py生成基准）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/nfcorpus_openai_vectors.json -g benchmark_results.json
+  # 指定基准文件路径（如果不在默认位置）
+  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -g path/to/benchmark.json
 
-  # 指定top-N
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/nfcorpus_gemini_vec.json -n 20
+  # 指定top-N（会自动从基准文件读取，如果基准文件的top_n不同会给出警告）
+  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_gemini_vectors.json -n 20
 
   # 指定collection名称
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/nfcorpus_gemini_multimodal_vec.json -c my_collection
+  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -c my_collection
+
+  # 强制重新创建collection（删除已存在的并重新插入数据）
+  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json --force-recreate
+
+注意:
+  - 基准文件会自动从.data/vector_search目录查找（优先）
+  - 如果找不到基准文件，评测会失败并提示需要先运行brute_force_benchmark.py
+  - 基准文件应包含ground_truth字段（query的top-N结果列表）
         """
     )
 
@@ -836,6 +959,12 @@ def main():
         help='预计算的基准结果文件路径（如果提供，将跳过基准计算）'
     )
 
+    parser.add_argument(
+        '--force-recreate',
+        action='store_true',
+        help='强制重新创建collection（删除已存在的collection并重新插入数据）'
+    )
+
     args = parser.parse_args()
 
     # 检查输入文件
@@ -848,7 +977,8 @@ def main():
             vector_file=args.input,
             top_n=args.top_n,
             collection_name=args.collection,
-            ground_truth_file=args.ground_truth
+            ground_truth_file=args.ground_truth,
+            force_recreate=args.force_recreate
         )
     except KeyboardInterrupt:
         print("\n⚠️  用户中断")
