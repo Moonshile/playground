@@ -102,7 +102,7 @@ def load_vector_data(vector_file: str) -> Tuple[Dict[str, Any], str]:
     加载向量数据文件
 
     Returns:
-        (数据字典（包含results和metadata）, 模型名称)
+        (数据字典, 模型名称)
     """
     print(f"📖 正在加载向量数据: {vector_file}")
     with open(vector_file, 'r', encoding='utf-8') as f:
@@ -110,24 +110,143 @@ def load_vector_data(vector_file: str) -> Tuple[Dict[str, Any], str]:
 
     # 获取模型名称
     model_name = data.get('metadata', {}).get('model', 'unknown')
-    results = data.get('results', [])
 
-    print(f"✅ 已加载 {len(results)} 条数据")
-    print(f"   模型: {model_name}")
+    # 检查数据格式
+    if 'query_vectors' in data and 'document_vectors' in data:
+        # 新格式：分离的query_vectors和document_vectors
+        query_count = len(data.get('query_vectors', []))
+        doc_count = len(data.get('document_vectors', []))
+        print(f"✅ 已加载数据（新格式）")
+        print(f"   Query向量数量: {query_count}")
+        print(f"   Document向量数量: {doc_count}")
+        print(f"   模型: {model_name}")
+    elif 'results' in data:
+        # 旧格式：results列表
+        results = data.get('results', [])
+        print(f"✅ 已加载 {len(results)} 条数据（旧格式）")
+        print(f"   模型: {model_name}")
+    else:
+        print(f"⚠️  未知的数据格式")
 
     return data, model_name
 
 
-def load_original_data(original_file: str) -> List[Dict[str, Any]]:
-    """加载原始QA数据文件"""
+def load_original_data(original_file: str):
+    """加载原始QA数据文件（支持新格式和旧格式）"""
     if not os.path.exists(original_file):
-        return []
+        return None
 
     print(f"📖 正在加载原始数据: {original_file}")
     with open(original_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    print(f"✅ 已加载 {len(data)} 条原始数据")
+
+    if isinstance(data, dict):
+        # 新格式
+        print(f"✅ 已加载原始数据（新格式）")
+    elif isinstance(data, list):
+        # 旧格式
+        print(f"✅ 已加载 {len(data)} 条原始数据（旧格式）")
+    else:
+        print(f"⚠️  原始数据格式未知")
+
     return data
+
+
+def extract_query_document_vectors_new_format(
+    vector_data: Dict[str, Any],
+    original_data_file: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    从新格式的向量数据中提取query和document向量
+
+    Args:
+        vector_data: 向量数据字典（包含query_vectors和document_vectors）
+        original_data_file: 原始QA数据文件路径
+
+    Returns:
+        (query列表, document列表)
+    """
+    queries = []
+    documents = []
+
+    query_vectors = vector_data.get('query_vectors', [])
+    document_vectors = vector_data.get('document_vectors', [])
+
+    # 加载原始数据
+    original_data = load_original_data(original_data_file)
+    if not original_data:
+        print("❌ 无法加载原始数据文件")
+        return queries, documents
+
+    # 检查原始数据格式
+    if isinstance(original_data, dict):
+        # 新格式：包含query_list和document_list
+        if 'query_list' in original_data and 'document_list' in original_data:
+            query_list = original_data['query_list']
+            document_list = original_data['document_list']
+        else:
+            print("❌ 原始数据格式不正确（新格式应包含query_list和document_list）")
+            return queries, documents
+    elif isinstance(original_data, list):
+        # 旧格式：列表，每个item包含query和document
+        # 提取唯一的query和document列表（按首次出现的顺序）
+        query_list = []
+        document_list = []
+        query_seen = set()
+        doc_seen = set()
+
+        for item in original_data:
+            query_text = item.get('query', '')
+            doc_text = item.get('document', '')
+
+            if query_text and query_text not in query_seen:
+                query_list.append(query_text)
+                query_seen.add(query_text)
+
+            if doc_text:
+                doc_hash = compute_sha2048(doc_text)
+                if doc_hash not in doc_seen:
+                    document_list.append(doc_text)
+                    doc_seen.add(doc_hash)
+    else:
+        print("❌ 原始数据格式未知")
+        return queries, documents
+
+    # 匹配向量和文本
+    print(f"📊 匹配向量和文本...")
+    print(f"   唯一Query: {len(query_list)}")
+    print(f"   唯一Document: {len(document_list)}")
+    print(f"   Query向量: {len(query_vectors)}")
+    print(f"   Document向量: {len(document_vectors)}")
+
+    # 验证数量
+    if len(query_vectors) != len(query_list):
+        print(f"⚠️  警告: Query向量数量 ({len(query_vectors)}) 与唯一Query数量 ({len(query_list)}) 不匹配")
+
+    if len(document_vectors) != len(document_list):
+        print(f"⚠️  警告: Document向量数量 ({len(document_vectors)}) 与唯一Document数量 ({len(document_list)}) 不匹配")
+
+    # 匹配query向量（按顺序）
+    for i, query_text in enumerate(query_list):
+        if i < len(query_vectors):
+            queries.append({
+                'query': query_text,
+                'vector': query_vectors[i],
+                'document': '',  # 新格式不包含document关联
+                'score': None
+            })
+
+    # 匹配document向量（按顺序）
+    for i, doc_text in enumerate(document_list):
+        if i < len(document_vectors):
+            doc_hash = compute_sha2048(doc_text)
+            documents.append({
+                'document': doc_text,
+                'vector': document_vectors[i],
+                'hash': doc_hash
+            })
+
+    return queries, documents
 
 
 def extract_query_document_vectors(
@@ -455,12 +574,39 @@ def run_benchmark(
 
     # 1. 加载数据
     vector_data, model_name = load_vector_data(vector_file)
-    results = vector_data.get('results', [])
     metadata = vector_data.get('metadata', {})
-
-    # 尝试获取原始数据文件路径
     original_file = metadata.get('input_file', '')
-    queries, documents = extract_query_document_vectors(results, original_file)
+
+    # 检查数据格式
+    if 'query_vectors' in vector_data and 'document_vectors' in vector_data:
+        # 新格式：分离的query_vectors和document_vectors
+        print(f"\n检测到新格式数据，使用新格式解析...")
+        if not original_file:
+            print("❌ 新格式需要原始数据文件路径，但metadata中未找到input_file")
+            return
+
+        # 尝试多个可能的路径
+        possible_paths = [
+            original_file,
+            os.path.join('.data', 'mteb', os.path.basename(original_file)),
+            os.path.join('.data/mteb', os.path.basename(original_file))
+        ]
+
+        found_original_file = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                found_original_file = path
+                break
+
+        if not found_original_file:
+            print(f"❌ 无法找到原始数据文件: {original_file}")
+            return
+
+        queries, documents = extract_query_document_vectors_new_format(vector_data, found_original_file)
+    else:
+        # 旧格式：results列表
+        results = vector_data.get('results', [])
+        queries, documents = extract_query_document_vectors(results, original_file)
 
     if not queries:
         print("❌ 未找到query向量，无法进行评测")
