@@ -1,21 +1,12 @@
 """
 将 mteb 检索数据集转换为 JSON 文件
-输出格式：JSON 列表，每个元素包含 query、document 和 score（可选）字段
+输出格式：包含 query_list 和 document_list 的 JSON 对象，两个列表都已去重
 
 输出格式示例:
-[
-  {
-    "query": "查询文本",
-    "document": "文档文本",
-    "score": 1.0  // 可选，表示相关性分数：1.0=相关，0.0=不相关
-  }
-]
-
-Score字段说明:
-- score = 1.0: 表示该文档与查询相关（positive样本）
-- score = 0.0: 表示该文档与查询不相关（negative样本）
-- 如果数据集中只有positive样本，所有score都是1.0
-- 如果数据集中有negative样本，score会是0.0
+{
+  "query_list": ["查询文本1", "查询文本2", ...],
+  "document_list": ["文档文本1", "文档文本2", ...]
+}
 
 使用方法:
     # 使用默认的小数据集 (nfcorpus)
@@ -587,9 +578,10 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
     if queries:
         query_id_map = build_query_id_map(queries)
 
-    # 转换数据
+    # 转换数据：收集所有唯一的 query 和 document
     print(f"\n正在转换数据...")
-    json_data = []
+    query_set = set()  # 使用 set 自动去重
+    document_set = set()  # 使用 set 自动去重
     skipped = 0
     total = len(split_data)
 
@@ -602,27 +594,37 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
         for example in batch:
             result = extract_query_and_document(example, corpus, doc_id_map, queries, query_id_map)
             if result:
-                json_data.append(result)
+                query = result.get("query")
+                document = result.get("document")
+                if query:
+                    query_set.add(query)
+                if document:
+                    document_set.add(document)
             else:
                 skipped += 1
 
         # 更频繁的进度显示
         processed = batch_end
         progress = (processed / total) * 100
-        print(f"  进度: {processed}/{total} ({progress:.1f}%) - 已转换: {len(json_data)}, 跳过: {skipped}")
+        print(f"  进度: {processed}/{total} ({progress:.1f}%) - 唯一query: {len(query_set)}, 唯一document: {len(document_set)}, 跳过: {skipped}")
+
+    # 转换为列表并排序（保持顺序一致性）
+    query_list = sorted(list(query_set))
+    document_list = sorted(list(document_set))
+
+    print(f"\n去重统计:")
+    print(f"  原始样本数: {total}")
+    print(f"  唯一query数: {len(query_list)}")
+    print(f"  唯一document数: {len(document_list)}")
+    print(f"  跳过样本数: {skipped}")
 
     # 验证转换结果，确保没有ID残留
     print(f"\n正在验证转换结果...")
     validation_issues = []
     id_like_queries = []
     id_like_docs = []
-    items_with_score = 0
-    items_without_score = 0
 
-    for idx, item in enumerate(json_data):
-        query = item.get("query", "")
-        document = item.get("document", "")
-
+    for idx, query in enumerate(query_list):
         # 检查query是否还是ID
         if is_likely_id(query):
             id_like_queries.append({
@@ -630,18 +632,13 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
                 "query": query[:50] if len(query) > 50 else query
             })
 
+    for idx, document in enumerate(document_list):
         # 检查document是否还是ID
         if is_likely_id(document):
             id_like_docs.append({
                 "index": idx,
                 "document": document[:50] if len(document) > 50 else document
             })
-
-        # 统计score字段
-        if "score" in item:
-            items_with_score += 1
-        else:
-            items_without_score += 1
 
     # 报告验证结果
     if id_like_queries or id_like_docs:
@@ -660,78 +657,50 @@ def convert_dataset_to_json(dataset_name: str, output_file: str, split: str = "t
         validation_issues = {
             "query_ids": len(id_like_queries),
             "document_ids": len(id_like_docs),
-            "total_issues": len(id_like_queries) + len(id_like_docs),
-            "items_with_score": items_with_score,
-            "items_without_score": items_without_score
+            "total_issues": len(id_like_queries) + len(id_like_docs)
         }
     else:
         print("✅ 验证通过：所有ID都已转换为实际文本")
         validation_issues = {
             "query_ids": 0,
             "document_ids": 0,
-            "total_issues": 0,
-            "items_with_score": items_with_score,
-            "items_without_score": items_without_score
+            "total_issues": 0
         }
-
-    # 报告score字段统计
-    if items_with_score > 0:
-        print(f"📊 Score字段统计:")
-        print(f"  - 包含score的样本: {items_with_score} ({items_with_score/len(json_data)*100:.1f}%)")
-        if items_without_score > 0:
-            print(f"  - 不包含score的样本: {items_without_score} ({items_without_score/len(json_data)*100:.1f}%)")
-
-        # 统计score值的分布
-        score_values = {}
-        for item in json_data:
-            if "score" in item:
-                s = item["score"]
-                score_values[s] = score_values.get(s, 0) + 1
-
-        if score_values:
-            print(f"  - Score值分布:")
-            for s, count in sorted(score_values.items(), reverse=True):
-                percentage = count / items_with_score * 100
-                meaning = "相关" if s == 1.0 else ("不相关" if s == 0.0 else "其他")
-                print(f"    score={s}: {count} 个样本 ({percentage:.1f}%) - {meaning}")
-    else:
-        print(f"⚠️  注意：数据集中未找到score字段")
 
     # 保存JSON文件
     print(f"\n正在保存JSON文件...")
     os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
 
+    # 构建输出格式：{"query_list": [...], "document_list": [...]}
+    output_data = {
+        "query_list": query_list,
+        "document_list": document_list
+    }
+
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(json_data, f, ensure_ascii=False, indent=2)
+        json.dump(output_data, f, ensure_ascii=False, indent=2)
 
     # 统计信息
     stats = {
         "dataset": dataset_name,
         "split": split,
         "total_samples": len(split_data),
-        "converted_samples": len(json_data),
+        "unique_queries": len(query_list),
+        "unique_documents": len(document_list),
         "skipped_samples": skipped,
         "output_file": output_file,
         "file_size_mb": os.path.getsize(output_file) / (1024 * 1024),
         "validation": validation_issues
     }
 
-    # 计算平均长度和score统计
-    if json_data:
-        avg_query_len = sum(len(item["query"]) for item in json_data) / len(json_data)
-        avg_doc_len = sum(len(item["document"]) for item in json_data) / len(json_data)
+    # 计算平均长度
+    if query_list:
+        avg_query_len = sum(len(q) for q in query_list) / len(query_list)
         stats["avg_query_length"] = round(avg_query_len, 2)
-        stats["avg_document_length"] = round(avg_doc_len, 2)
 
-        # 计算score统计（如果存在）
-        scores = [item.get("score") for item in json_data if "score" in item and item["score"] is not None]
-        if scores:
-            stats["score_stats"] = {
-                "count": len(scores),
-                "min": round(min(scores), 4),
-                "max": round(max(scores), 4),
-                "avg": round(sum(scores) / len(scores), 4)
-            }
+    if document_list:
+        avg_doc_len = sum(len(d) for d in document_list) / len(document_list)
+        stats["avg_document_length"] = round(avg_doc_len, 2)
 
     return stats
 
@@ -779,22 +748,22 @@ if __name__ == "__main__":
                 output_file = arg
             i += 1
 
-    # 验证数据集
-    if dataset_key not in SMALL_DATASETS:
-        print(f"❌ 未知的数据集: {dataset_key}")
-        print("\n可用的数据集:")
-        for key in SMALL_DATASETS.keys():
-            print(f"  - {key}")
-        print("\n使用 --list 查看详细信息")
-        sys.exit(1)
-
     # 获取数据集信息
-    dataset_info = SMALL_DATASETS[dataset_key]
-    dataset_name = dataset_info["name"]
-
-    print(f"\n📦 使用数据集: {dataset_key}")
-    print(f"   {dataset_info['description']}")
-    print(f"   大小: {dataset_info['size']}\n")
+    if dataset_key in SMALL_DATASETS:
+        # 使用白名单中的数据集信息
+        dataset_info = SMALL_DATASETS[dataset_key]
+        dataset_name = dataset_info["name"]
+        print(f"\n📦 使用数据集: {dataset_key}")
+        print(f"   {dataset_info['description']}")
+        print(f"   大小: {dataset_info['size']}\n")
+    else:
+        # 使用用户指定的数据集名称（自动添加 mteb/ 前缀如果不存在）
+        if dataset_key.startswith("mteb/"):
+            dataset_name = dataset_key
+        else:
+            dataset_name = f"mteb/{dataset_key}"
+        print(f"\n📦 使用数据集: {dataset_name}")
+        print(f"   (用户指定的数据集，不在推荐列表中)\n")
 
     # 转换数据
     try:
@@ -807,18 +776,13 @@ if __name__ == "__main__":
         print(f"数据集: {stats['dataset']}")
         print(f"拆分: {stats['split']}")
         print(f"总样本数: {stats['total_samples']}")
-        print(f"成功转换: {stats['converted_samples']}")
+        print(f"唯一query数: {stats['unique_queries']}")
+        print(f"唯一document数: {stats['unique_documents']}")
         print(f"跳过样本: {stats['skipped_samples']}")
         if 'avg_query_length' in stats:
             print(f"平均查询长度: {stats['avg_query_length']} 字符")
+        if 'avg_document_length' in stats:
             print(f"平均文档长度: {stats['avg_document_length']} 字符")
-        if 'score_stats' in stats:
-            score_stats = stats['score_stats']
-            print(f"\nScore统计:")
-            print(f"  包含score的样本数: {score_stats['count']}")
-            print(f"  最小值: {score_stats['min']}")
-            print(f"  最大值: {score_stats['max']}")
-            print(f"  平均值: {score_stats['avg']}")
         print(f"输出文件: {stats['output_file']}")
         print(f"文件大小: {stats['file_size_mb']:.2f} MB")
         if 'validation' in stats:

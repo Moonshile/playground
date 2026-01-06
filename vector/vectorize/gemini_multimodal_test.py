@@ -6,8 +6,9 @@
     python vector/vectorize/gemini_multimodal_test.py -i input.json -o output.json --project YOUR_PROJECT --location us-central1
     python vector/vectorize/gemini_multimodal_test.py -i input.json -o output.json -m multimodalembedding@001 -r 5 --restart --max-items 10
 
-输入文件格式（JSON 列表，每条至少包含 text，image/video 可选）：
-[
+输入文件格式（支持两种格式）：
+1. 新格式（QA数据）: {"query_list": [...], "document_list": [...]}
+2. 旧格式（多模态数据）: [
   {
     "id": "item-1",
     "text": "一段文本",
@@ -44,12 +45,42 @@ def atomic_write(path: str, data: Dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def load_data(input_file: str) -> List[Dict[str, Any]]:
+def load_data(input_file: str) -> Dict[str, Any]:
+    """
+    加载数据
+    支持两种格式：
+    1. 新格式: {"query_list": [...], "document_list": [...]}
+    2. 旧格式: [{"id": ..., "text": ..., "image": ..., "video": ...}]
+    """
     print(f"📖 正在加载数据: {input_file}")
     with open(input_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    print(f"✅ 已加载 {len(data)} 条数据")
-    return data
+
+    # 检测数据格式
+    if isinstance(data, dict) and "query_list" in data and "document_list" in data:
+        # 新格式：转换为列表格式
+        query_list = data.get("query_list", [])
+        document_list = data.get("document_list", [])
+        # 合并为列表，每个元素包含 text 字段
+        items = []
+        for query in query_list:
+            items.append({"text": query})
+        for document in document_list:
+            items.append({"text": document})
+        print(f"✅ 已加载新格式数据: {len(query_list)} 条query + {len(document_list)} 条document = {len(items)} 条数据")
+        return {
+            "format": "new",
+            "data": items
+        }
+    elif isinstance(data, list):
+        # 旧格式：列表格式
+        print(f"✅ 已加载旧格式数据: {len(data)} 条数据")
+        return {
+            "format": "old",
+            "data": data
+        }
+    else:
+        raise ValueError(f"不支持的数据格式。期望格式: {{\"query_list\": [...], \"document_list\": [...]}} 或 [{{\"text\": ..., \"image\": ..., \"video\": ...}}]")
 
 
 def load_credentials():
@@ -181,6 +212,7 @@ def load_checkpoint(output_file: str) -> Dict[str, Any]:
                 "total_tokens": 0,
                 "total_cost": 0.0,
             },
+            "vector_cache": {},  # 用于存储去重后的向量
         }
     try:
         with open(ckpt_path, "r", encoding="utf-8") as f:
@@ -199,6 +231,7 @@ def load_checkpoint(output_file: str) -> Dict[str, Any]:
                 "total_tokens": 0,
                 "total_cost": 0.0,
             },
+            "vector_cache": {},  # 用于存储去重后的向量
         }
 
 
@@ -217,6 +250,20 @@ def print_report(perf_log: List[Dict[str, Any]], total: int, model: str) -> None
           f"速度: {last['items_per_sec']:.2f} 项/秒, "
           f"Token: {last['total_tokens']:,}, 费用: ${last['total_cost']:.4f}, "
           f"模型: {model}")
+
+
+# ==================== 去重工具函数 ====================
+
+def get_item_key(item: Dict[str, Any]) -> str:
+    """
+    生成 item 的唯一键，用于去重
+    基于 text/query/document + image + video 的组合
+    """
+    text = item.get("text") or item.get("query") or item.get("document") or ""
+    image = item.get("image") or ""
+    video = item.get("video") or ""
+    # 使用组合键确保唯一性
+    return f"{text}|{image}|{video}"
 
 
 # ==================== 主流程 ====================
@@ -242,7 +289,8 @@ def process(
     model_name = model if model else DEFAULT_MODEL
     mm_model = MultiModalEmbeddingModel.from_pretrained(model_name)
 
-    data = load_data(input_file)
+    loaded_data = load_data(input_file)
+    data = loaded_data["data"]
     if max_items:
         data = data[:max_items]
 
@@ -266,73 +314,148 @@ def process(
         "total_tokens": 0,
         "total_cost": 0.0,
     })
+    vector_cache = checkpoint.get("vector_cache", {})
     start_index = processed
 
     print(f"✅ 恢复进度: 已处理 {processed} 条，剩余 {len(data) - processed} 条")
 
+    # 去重分析：构建去重映射
+    remaining_data = data[start_index:]
+    print(f"🔍 去重分析: 原始 {len(remaining_data)} 条")
+    unique_items = {}
+    item_to_unique_map = []  # 原始索引 -> 唯一item的映射
+    for i, item in enumerate(remaining_data):
+        item_key = get_item_key(item)
+        if item_key not in unique_items:
+            unique_items[item_key] = len(unique_items)
+        item_to_unique_map.append(unique_items[item_key])
+
+    unique_item_list = list(unique_items.keys())
+    print(f"   去重后: {len(unique_item_list)} 条唯一item (节省 {len(remaining_data) - len(unique_item_list)} 次API调用)")
+
+    # 检查缓存中已有的向量
+    cached_count = 0
+    unique_item_vectors = {}  # 存储唯一item的向量
+    for item_key in unique_item_list:
+        if item_key in vector_cache:
+            unique_item_vectors[item_key] = vector_cache[item_key]
+            cached_count += 1
+
+    if cached_count > 0:
+        print(f"   💾 从缓存中恢复 {cached_count} 个向量")
+
+    # 构建唯一item列表（从原始数据中提取）
+    unique_item_data = []
+    seen_keys = set()
+    for item in remaining_data:
+        item_key = get_item_key(item)
+        if item_key not in seen_keys:
+            unique_item_data.append(item)
+            seen_keys.add(item_key)
+
+    # 只处理未缓存的唯一item
+    uncached_unique_items = []
+    uncached_indices = []
+    for i, item in enumerate(unique_item_data):
+        item_key = get_item_key(item)
+        if item_key not in unique_item_vectors:
+            uncached_unique_items.append(item)
+            uncached_indices.append(start_index + i)
+
     skipped = 0
     last_batch_was_reported = False
 
-    for batch_start in range(start_index, len(data), batch_size):
-        batch = data[batch_start: batch_start + batch_size]
-        for offset, item in enumerate(batch):
-            idx = batch_start + offset
-            try:
-                embedded = embed_item(mm_model, item, video_segment_config=VideoSegmentConfig(end_offset_sec=1))
+    # 先处理未缓存的唯一item
+    api_calls_made = 0
+    for i, item in enumerate(uncached_unique_items):
+        try:
+            embedded = embed_item(mm_model, item, video_segment_config=VideoSegmentConfig(end_offset_sec=1))
 
-                # 如果数据为空（无 text/image/video），跳过但不报错
-                if embedded is None:
-                    skipped += 1
-                    continue
+            # 如果数据为空（无 text/image/video），跳过但不报错
+            if embedded is None:
+                skipped += 1
+                continue
 
-                results.append(embedded)
-                cumulative_api += embedded["api_time_seconds"]
-                processed = idx + 1
+            item_key = get_item_key(item)
+            unique_item_vectors[item_key] = embedded
+            vector_cache[item_key] = embedded
+            api_calls_made += 1
 
-                # 更新累计 token / cost
-                estimated_tokens = embedded.get("estimated_tokens", 0)
-                cumulative_stats["prompt_tokens"] += estimated_tokens
-                cumulative_stats["total_tokens"] += estimated_tokens
-                cumulative_stats["total_cost"] = (cumulative_stats["total_tokens"] / 1_000_000) * DEFAULT_PRICE_PER_MILLION
+            cumulative_api += embedded["api_time_seconds"]
 
-                perf = {
-                    "processed": processed,
-                    "api_time": embedded["api_time_seconds"],
-                    "cumulative_api_time": cumulative_api,
-                    "items_per_sec": processed / cumulative_api if cumulative_api > 0 else 0,
-                    "prompt_tokens": cumulative_stats["prompt_tokens"],
-                    "total_tokens": cumulative_stats["total_tokens"],
-                    "total_cost": cumulative_stats["total_cost"],
-                }
-                performance.append(perf)
+            # 更新累计 token / cost
+            estimated_tokens = embedded.get("estimated_tokens", 0)
+            cumulative_stats["prompt_tokens"] += estimated_tokens
+            cumulative_stats["total_tokens"] += estimated_tokens
+            cumulative_stats["total_cost"] = (cumulative_stats["total_tokens"] / 1_000_000) * DEFAULT_PRICE_PER_MILLION
 
-                # 在打印性能报告时保存检查点（逻辑分离：先打印报告，再保存检查点）
-                if processed % report_interval == 0:
-                    print_report(performance, len(data), model_name)
-                    save_checkpoint(output_file, {
-                        "processed": processed,
-                        "results": results,
-                        "performance": performance,
-                        "cumulative_api_time": cumulative_api,
-                        "cumulative_stats": cumulative_stats,
-                        "model": model_name,
-                    })
-                    last_batch_was_reported = True
-                elif idx == len(data) - 1:
-                    # 最后一条，即使不满足报告间隔也要标记
-                    last_batch_was_reported = False
-            except Exception as e:
-                print(f"❌ 处理第 {idx + 1} 条失败: {e}")
-                save_checkpoint(output_file, {
-                    "processed": processed,
-                    "results": results,
-                    "performance": performance,
-                    "cumulative_api_time": cumulative_api,
-                    "model": model_name,
-                    "error": str(e),
-                })
-                raise
+        except Exception as e:
+            print(f"❌ 处理唯一item失败: {e}")
+            save_checkpoint(output_file, {
+                "processed": processed,
+                "results": results,
+                "performance": performance,
+                "cumulative_api_time": cumulative_api,
+                "vector_cache": vector_cache,
+                "model": model_name,
+                "error": str(e),
+            })
+            raise
 
+    # 处理所有剩余数据，使用缓存或已生成的向量
+    for idx in range(start_index, len(data)):
+        item = data[idx]
+        item_key = get_item_key(item)
+
+        # 从缓存或已生成的向量中获取
+        if item_key in unique_item_vectors:
+            embedded = unique_item_vectors[item_key]
+        elif item_key in vector_cache:
+            embedded = vector_cache[item_key]
+            unique_item_vectors[item_key] = embedded
+        else:
+            # 这种情况不应该发生，但为了安全起见
+            continue
+
+        # 确保results列表足够长
+        while len(results) <= idx:
+            results.append(None)
+        results[idx] = embedded
+
+        processed = idx + 1
+
+        perf = {
+            "processed": processed,
+            "api_time": embedded.get("api_time_seconds", 0.0),
+            "cumulative_api_time": cumulative_api,
+            "items_per_sec": processed / cumulative_api if cumulative_api > 0 else 0,
+            "prompt_tokens": cumulative_stats["prompt_tokens"],
+            "total_tokens": cumulative_stats["total_tokens"],
+            "total_cost": cumulative_stats["total_cost"],
+        }
+        performance.append(perf)
+
+        # 在打印性能报告时保存检查点（逻辑分离：先打印报告，再保存检查点）
+        if processed % report_interval == 0:
+            print_report(performance, len(data), model_name)
+            save_checkpoint(output_file, {
+                "processed": processed,
+                "results": results,
+                "performance": performance,
+                "cumulative_api_time": cumulative_api,
+                "cumulative_stats": cumulative_stats,
+                "vector_cache": vector_cache,
+                "model": model_name,
+            })
+            last_batch_was_reported = True
+        elif idx == len(data) - 1:
+            # 最后一条，即使不满足报告间隔也要标记
+            last_batch_was_reported = False
+
+    if api_calls_made == 0 and cached_count > 0:
+        print(f"   ✅ 所有向量已从缓存中恢复，无需API调用")
+
+    # 处理完成，如果最后一批没有报告，则输出最终报告
     # 处理完成，如果最后一批没有报告，则输出最终报告
     if not last_batch_was_reported and processed > 0:
         print_report(performance, len(data), model_name)
@@ -342,6 +465,7 @@ def process(
             "performance": performance,
             "cumulative_api_time": cumulative_api,
             "cumulative_stats": cumulative_stats,
+            "vector_cache": vector_cache,
             "model": model_name,
         })
 

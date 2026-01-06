@@ -10,5 +10,6 @@ dependencies = [
     "google-genai>=1.56.0",
     "mteb>=2.4.2",
     "openai>=2.14.0",
+    "pymilvus>=2.6.6",
     "requests>=2.32.5",
 ]

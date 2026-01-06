@@ -146,13 +146,37 @@ def vectorize_texts_batch(
 
 # ==================== 数据加载和检查点 ====================
 
-def load_qa_data(input_file: str) -> List[Dict[str, Any]]:
-    """加载QA数据"""
+def load_qa_data(input_file: str) -> Dict[str, Any]:
+    """
+    加载QA数据
+    支持两种格式：
+    1. 新格式: {"query_list": [...], "document_list": [...]}
+    2. 旧格式: [{"query": "...", "document": "...", "score": ...}]
+    """
     print(f"📖 正在加载数据: {input_file}")
     with open(input_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    print(f"✅ 已加载 {len(data)} 条数据")
-    return data
+
+    # 检测数据格式
+    if isinstance(data, dict) and "query_list" in data and "document_list" in data:
+        # 新格式：{"query_list": [...], "document_list": [...]}
+        query_list = data.get("query_list", [])
+        document_list = data.get("document_list", [])
+        print(f"✅ 已加载新格式数据: {len(query_list)} 条唯一query, {len(document_list)} 条唯一document")
+        return {
+            "format": "new",
+            "query_list": query_list,
+            "document_list": document_list
+        }
+    elif isinstance(data, list):
+        # 旧格式：列表格式
+        print(f"✅ 已加载旧格式数据: {len(data)} 条数据")
+        return {
+            "format": "old",
+            "data": data
+        }
+    else:
+        raise ValueError(f"不支持的数据格式。期望格式: {{\"query_list\": [...], \"document_list\": [...]}} 或 [{{\"query\": ..., \"document\": ...}}]")
 
 
 def get_default_cumulative_stats() -> Dict[str, Any]:
@@ -175,7 +199,8 @@ def get_default_checkpoint() -> Dict[str, Any]:
         "results": [],
         "performance": [],
         "cumulative_stats": get_default_cumulative_stats(),
-        "query_vector_cache": {}  # 用于存储去重后的query向量
+        "query_vector_cache": {},  # 用于存储去重后的query向量
+        "document_vector_cache": {}  # 用于存储去重后的document向量
     }
 
 
@@ -210,6 +235,9 @@ def load_checkpoint(output_file: str) -> Dict[str, Any]:
             # 恢复query向量缓存（用于去重）
             if 'query_vector_cache' not in checkpoint:
                 checkpoint['query_vector_cache'] = {}
+            # 恢复document向量缓存（用于去重）
+            if 'document_vector_cache' not in checkpoint:
+                checkpoint['document_vector_cache'] = {}
 
             return checkpoint
         except json.JSONDecodeError as e:
@@ -347,14 +375,18 @@ def process_batch(
     model: str,
     client: OpenAI,
     batch_size: int,
-    processed_count: int,
-    total_count: int,
+    processed_unique_count: int,
+    unique_total_count: int,
     performance_log: List[Dict[str, Any]],
     cumulative_stats: Dict[str, Any],
     report_interval: int
 ) -> Tuple[List[List[float]], float, int, int, bool]:
     """
     处理一批文本，返回向量、API时间、token统计
+
+    Args:
+        processed_unique_count: 已处理的唯一项数量（用于进度显示分子）
+        unique_total_count: 去重后的总数（用于进度显示分母）
 
     Returns:
         (向量列表, API总时间, prompt_tokens, total_tokens, should_report)
@@ -383,15 +415,15 @@ def process_batch(
     # 更新累计统计
     update_cumulative_stats(cumulative_stats, token_info, text_type, model)
 
-    # 打印进度
-    processed = processed_count + (batch_index + 1) * batch_size
-    if processed > total_count:
-        processed = total_count
-    progress = processed / total_count * 100
+    # 打印进度：使用实际已处理的唯一项数量作为分子，去重后的总数作为分母
+    processed = processed_unique_count + len(texts)
+    if processed > unique_total_count:
+        processed = unique_total_count
+    progress = processed / unique_total_count * 100 if unique_total_count > 0 else 0
     print(f"   {text_type.capitalize()}批次 {batch_index + 1}: {len(texts)} 条, "
           f"API调用时间 {api_time:.2f}s, "
           f"Token: {token_info.get('total_tokens', 0):,}, "
-          f"总进度: {processed}/{total_count} ({progress:.1f}%)")
+          f"总进度: {processed}/{unique_total_count} ({progress:.1f}%)")
 
     # 返回是否需要打印报告（由调用者决定是否打印和保存检查点）
     should_report = (batch_index + 1) % report_interval == 0
@@ -414,6 +446,7 @@ def save_checkpoint_with_results(
     performance_log: List[Dict[str, Any]],
     cumulative_stats: Dict[str, Any],
     query_vector_cache: Optional[Dict[str, List[float]]] = None,
+    document_vector_cache: Optional[Dict[str, List[float]]] = None,
     verbose: bool = False
 ):
     """
@@ -427,6 +460,8 @@ def save_checkpoint_with_results(
     checkpoint["cumulative_stats"] = cumulative_stats
     if query_vector_cache is not None:
         checkpoint["query_vector_cache"] = query_vector_cache
+    if document_vector_cache is not None:
+        checkpoint["document_vector_cache"] = document_vector_cache
     save_checkpoint(output_file, checkpoint, verbose=verbose)
 
 
@@ -468,13 +503,40 @@ def process_qa_data(
     print("=" * 60)
 
     # 加载数据
-    data = load_qa_data(input_file)
+    loaded_data = load_qa_data(input_file)
 
-    # 如果指定了最大条数，则截取数据
-    original_data_count = len(data)
-    if max_items and max_items > 0:
-        data = data[:max_items]
-        print(f"📊 数据限制: 从 {original_data_count} 条限制到 {len(data)} 条")
+    # 根据数据格式处理
+    if loaded_data["format"] == "new":
+        # 新格式：已经去重的列表
+        query_list = loaded_data["query_list"]
+        document_list = loaded_data["document_list"]
+
+        # 如果指定了最大条数，则截取数据
+        if max_items and max_items > 0:
+            original_query_count = len(query_list)
+            original_doc_count = len(document_list)
+            query_list = query_list[:max_items]
+            document_list = document_list[:max_items]
+            print(f"📊 数据限制: Query从 {original_query_count} 条限制到 {len(query_list)} 条")
+            print(f"📊 数据限制: Document从 {original_doc_count} 条限制到 {len(document_list)} 条")
+
+        # 转换为旧格式的兼容结构（用于后续处理）
+        data_format = "new"
+        data = None  # 新格式不需要 data 列表
+    else:
+        # 旧格式：列表格式
+        data = loaded_data["data"]
+        data_format = "old"
+
+        # 如果指定了最大条数，则截取数据
+        original_data_count = len(data)
+        if max_items and max_items > 0:
+            data = data[:max_items]
+            print(f"📊 数据限制: 从 {original_data_count} 条限制到 {len(data)} 条")
+
+        # 从旧格式中提取 query_list 和 document_list
+        query_list = [item["query"] for item in data if item.get("query")]
+        document_list = [item["document"] for item in data if item.get("document")]
 
     # 加载检查点（如果 from_scratch=True，则忽略已有检查点，从头开始）
     if from_scratch:
@@ -492,11 +554,12 @@ def process_qa_data(
     performance_log = checkpoint.get("performance", [])
     cumulative_stats = checkpoint.get("cumulative_stats", get_default_cumulative_stats())
     query_vector_cache = checkpoint.get("query_vector_cache", {})
+    document_vector_cache = checkpoint.get("document_vector_cache", {})
 
     if query_processed_count > 0 or document_processed_count > 0:
         print(f"🔄 断点续跑状态:")
-        print(f"   Query: {query_processed_count}/{len(data)} 条已处理")
-        print(f"   Document: {document_processed_count}/{len(data)} 条已处理")
+        print(f"   Query: {query_processed_count}/{len(query_list)} 条已处理")
+        print(f"   Document: {document_processed_count}/{len(document_list)} 条已处理")
         if cumulative_stats.get("total_tokens", 0) > 0:
             print(f"   累计Token: {cumulative_stats['total_tokens']:,}")
             print(f"   累计费用: ${cumulative_stats.get('total_cost', 0):.4f}")
@@ -504,33 +567,24 @@ def process_qa_data(
     # 获取客户端
     client = get_openai_client()
 
-    # 处理剩余的数据
-    query_remaining_data = data[query_processed_count:]
-    document_remaining_data = data[document_processed_count:]
+    # 处理剩余的数据（新格式已经是去重后的列表）
+    query_remaining_data = query_list[query_processed_count:]
+    document_remaining_data = document_list[document_processed_count:]
 
     if len(query_remaining_data) == 0 and len(document_remaining_data) == 0:
         print("✅ 所有数据已处理完成！")
         return
 
     print(f"\n📊 处理进度:")
-    print(f"   Query: {query_processed_count}/{len(data)} ({query_processed_count/len(data)*100:.1f}%), 剩余: {len(query_remaining_data)} 条")
-    print(f"   Document: {document_processed_count}/{len(data)} ({document_processed_count/len(data)*100:.1f}%), 剩余: {len(document_remaining_data)} 条\n")
+    print(f"   Query: {query_processed_count}/{len(query_list)} ({query_processed_count/len(query_list)*100:.1f}%), 剩余: {len(query_remaining_data)} 条")
+    print(f"   Document: {document_processed_count}/{len(document_list)} ({document_processed_count/len(document_list)*100:.1f}%), 剩余: {len(document_remaining_data)} 条\n")
 
-    # 提取query和document文本（分别从剩余数据中提取）
-    queries = [item["query"] for item in query_remaining_data]
-    documents = [item["document"] for item in document_remaining_data]
+    # 新格式已经是去重后的列表，直接使用
+    unique_query_list = query_remaining_data
+    unique_document_list = document_remaining_data
 
-    # Query去重：构建去重映射
-    print(f"🔍 Query去重分析: 原始 {len(queries)} 条")
-    unique_queries = {}
-    query_to_unique_map = []  # 原始索引 -> 唯一query的映射
-    for i, query in enumerate(queries):
-        if query not in unique_queries:
-            unique_queries[query] = len(unique_queries)
-        query_to_unique_map.append(unique_queries[query])
-
-    unique_query_list = list(unique_queries.keys())
-    print(f"   去重后: {len(unique_query_list)} 条唯一query (节省 {len(queries) - len(unique_query_list)} 次API调用)")
+    print(f"🔍 Query去重分析: 数据已去重，共 {len(unique_query_list)} 条唯一query")
+    print(f"🔍 Document去重分析: 数据已去重，共 {len(unique_document_list)} 条唯一document")
 
     # 处理query向量（使用去重后的唯一query）
     print("🔍 正在处理query向量（已去重）...")
@@ -555,6 +609,7 @@ def process_qa_data(
 
     if uncached_unique_queries:
         num_batches = (len(uncached_unique_queries) + batch_size - 1) // batch_size
+        processed_unique_queries = 0  # 跟踪已处理的唯一query数量
 
         for i in range(num_batches):
             start_idx = i * batch_size
@@ -564,8 +619,11 @@ def process_qa_data(
             try:
                 batch_vectors, api_time, prompt_tokens, total_tokens, should_report = process_batch(
                     batch_queries, "query", i, model, client, batch_size,
-                    query_processed_count, len(data), performance_log, cumulative_stats, report_interval
+                    processed_unique_queries, len(uncached_unique_queries), performance_log, cumulative_stats, report_interval
                 )
+
+                # 更新已处理的唯一query数量
+                processed_unique_queries += len(batch_queries)
 
                 query_api_time_total += api_time
                 query_total_prompt_tokens += prompt_tokens
@@ -577,35 +635,20 @@ def process_qa_data(
                     unique_query_vectors[query_text] = qv
                     query_vector_cache[query_text] = qv
 
-                    # 同时更新所有使用这个query的results
-                    for orig_idx in range(len(data)):
-                        if data[orig_idx].get("query") == query_text:
-                            # 确保results列表足够长
-                            while len(results) <= orig_idx:
-                                temp_idx = len(results)
-                                results.append({
-                                    "query": data[temp_idx].get("query", ""),
-                                    "document": data[temp_idx].get("document", ""),
-                                    "query_vector": None,
-                                    "document_vector": None,
-                                    "score": data[temp_idx].get("score")
-                                })
-                            results[orig_idx]["query_vector"] = qv
-
                 # 在打印性能报告时保存检查点（逻辑分离：先打印报告，再保存检查点）
                 if should_report:
-                    # 计算已处理的query数量（所有query都已处理，因为去重后都处理完了）
-                    current_query_processed = query_processed_count + len(query_remaining_data)
+                    # 计算已处理的query数量
+                    current_query_processed = query_processed_count + processed_unique_queries
                     # 打印性能报告
                     print_performance_report(
-                        performance_log, current_query_processed, len(data), "query", model, cumulative_stats
+                        performance_log, current_query_processed, len(query_list), "query", model, cumulative_stats
                     )
                     # 保存检查点（包含query向量缓存）
                     save_checkpoint_with_results(
                         output_file, checkpoint, results,
                         current_query_processed,
                         document_processed_count,
-                        performance_log, cumulative_stats, query_vector_cache, verbose=True
+                        performance_log, cumulative_stats, query_vector_cache, document_vector_cache, verbose=True
                     )
                     last_batch_was_reported = True
                 elif i == num_batches - 1:
@@ -618,34 +661,19 @@ def process_qa_data(
     else:
         print(f"   ✅ 所有query向量已从缓存中恢复，无需API调用")
 
-    # 确保所有query向量都已保存到results中（从缓存中获取）
-    for i in range(len(data)):
-        if i >= len(results):
-            results.append({
-                "query": data[i].get("query", ""),
-                "document": data[i].get("document", ""),
-                "query_vector": query_vector_cache.get(data[i].get("query", "")),
-                "document_vector": None,
-                "score": data[i].get("score")
-            })
-        elif results[i].get("query_vector") is None:
-            query_text = data[i].get("query", "")
-            if query_text in query_vector_cache:
-                results[i]["query_vector"] = query_vector_cache[query_text]
-
     # Query处理完成，如果最后一批没有报告，则输出最终报告
     final_query_processed = query_processed_count + len(query_remaining_data)
     if not last_batch_was_reported and (len(uncached_unique_queries) > 0 or cached_count > 0):
         # 打印最终query性能报告
         print_performance_report(
-            performance_log, final_query_processed, len(data), "query", model, cumulative_stats
+            performance_log, final_query_processed, len(query_list), "query", model, cumulative_stats
         )
         # 保存检查点
         save_checkpoint_with_results(
             output_file, checkpoint, results,
             final_query_processed,
             document_processed_count,
-            performance_log, cumulative_stats, query_vector_cache, verbose=True
+            performance_log, cumulative_stats, query_vector_cache, document_vector_cache, verbose=True
         )
 
     print(f"✅ Query向量处理完成，总API调用时间: {query_api_time_total:.2f}s, "
@@ -654,119 +682,136 @@ def process_qa_data(
 
     # 处理document向量
     print("📄 正在处理document向量...")
+
+    # 新格式已经是去重后的列表，直接使用
+    unique_document_list = document_remaining_data
+
     doc_api_time_total = 0.0
-    doc_vectors = []
+    unique_document_vectors = {}  # 存储唯一document的向量
     doc_total_prompt_tokens = 0
     doc_total_tokens = 0
 
-    num_batches = (len(documents) + batch_size - 1) // batch_size
+    # 检查缓存中已有的document向量
+    cached_doc_count = 0
+    for document in unique_document_list:
+        if document in document_vector_cache:
+            unique_document_vectors[document] = document_vector_cache[document]
+            cached_doc_count += 1
+
+    if cached_doc_count > 0:
+        print(f"   💾 从缓存中恢复 {cached_doc_count} 个document向量")
+
+    # 只处理未缓存的唯一document
+    uncached_unique_documents = [d for d in unique_document_list if d not in unique_document_vectors]
+
+    num_batches = (len(uncached_unique_documents) + batch_size - 1) // batch_size if uncached_unique_documents else 0
     last_doc_batch_was_reported = False
 
-    for i in range(num_batches):
-        start_idx = i * batch_size
-        end_idx = min(start_idx + batch_size, len(documents))
-        batch_docs = documents[start_idx:end_idx]
+    if uncached_unique_documents:
+        processed_unique_documents = 0  # 跟踪已处理的唯一document数量
 
-        try:
-            batch_vectors, api_time, prompt_tokens, total_tokens, should_report = process_batch(
-                batch_docs, "document", i, model, client, batch_size,
-                document_processed_count, len(data), performance_log, cumulative_stats, report_interval
-            )
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, len(uncached_unique_documents))
+            batch_docs = uncached_unique_documents[start_idx:end_idx]
 
-            doc_vectors.extend(batch_vectors)
-            doc_api_time_total += api_time
-            doc_total_prompt_tokens += prompt_tokens
-            doc_total_tokens += total_tokens
-
-            # 更新结果（填充document向量）
-            for j, dv in enumerate(batch_vectors):
-                idx = document_processed_count + start_idx + j
-                # 确保results列表足够长
-                while len(results) <= idx:
-                    temp_idx = len(results)
-                    query_text = data[temp_idx].get("query", "")
-                    results.append({
-                        "query": query_text,
-                        "document": data[temp_idx].get("document", ""),
-                        "query_vector": query_vector_cache.get(query_text),
-                        "document_vector": None,
-                        "score": data[temp_idx].get("score")
-                    })
-
-                results[idx]["document_vector"] = dv
-                # 如果query向量还没有，从缓存中获取
-                if results[idx].get("query_vector") is None:
-                    query_text = data[idx].get("query", "")
-                    if query_text in query_vector_cache:
-                        results[idx]["query_vector"] = query_vector_cache[query_text]
-
-            # 在打印性能报告时保存检查点（逻辑分离：先打印报告，再保存检查点）
-            if should_report:
-                current_doc_processed = document_processed_count + end_idx
-                # 打印性能报告
-                print_performance_report(
-                    performance_log, current_doc_processed, len(data), "document", model, cumulative_stats
+            try:
+                batch_vectors, api_time, prompt_tokens, total_tokens, should_report = process_batch(
+                    batch_docs, "document", i, model, client, batch_size,
+                    processed_unique_documents, len(uncached_unique_documents), performance_log, cumulative_stats, report_interval
                 )
-                # 保存检查点
-                save_checkpoint_with_results(
-                    output_file, checkpoint, results,
-                    final_query_processed,  # 所有query都已处理
-                    current_doc_processed,
-                    performance_log, cumulative_stats, query_vector_cache, verbose=True
-                )
-                last_doc_batch_was_reported = True
-            elif i == num_batches - 1:
-                # 最后一批，即使不满足报告间隔也要报告
-                last_doc_batch_was_reported = False
 
-        except Exception as e:
-            print(f"   ❌ Document批次 {i + 1} 处理失败: {e}")
-            raise
+                # 更新已处理的唯一document数量
+                processed_unique_documents += len(batch_docs)
+
+                doc_api_time_total += api_time
+                doc_total_prompt_tokens += prompt_tokens
+                doc_total_tokens += total_tokens
+
+                # 存储唯一document的向量到缓存
+                for j, dv in enumerate(batch_vectors):
+                    document_text = batch_docs[j]
+                    unique_document_vectors[document_text] = dv
+                    document_vector_cache[document_text] = dv
+
+                # 在打印性能报告时保存检查点（逻辑分离：先打印报告，再保存检查点）
+                if should_report:
+                    current_doc_processed = document_processed_count + processed_unique_documents
+                    # 打印性能报告
+                    print_performance_report(
+                        performance_log, current_doc_processed, len(document_list), "document", model, cumulative_stats
+                    )
+                    # 保存检查点
+                    save_checkpoint_with_results(
+                        output_file, checkpoint, results,
+                        final_query_processed,  # 所有query都已处理
+                        current_doc_processed,
+                        performance_log, cumulative_stats, query_vector_cache, document_vector_cache, verbose=True
+                    )
+                    last_doc_batch_was_reported = True
+                elif i == num_batches - 1:
+                    # 最后一批，即使不满足报告间隔也要报告
+                    last_doc_batch_was_reported = False
+
+            except Exception as e:
+                print(f"   ❌ Document批次 {i + 1} 处理失败: {e}")
+                raise
+    else:
+        print(f"   ✅ 所有document向量已从缓存中恢复，无需API调用")
 
     # Document处理完成，如果最后一批没有报告，则输出最终报告
     final_doc_processed = document_processed_count + len(document_remaining_data)
-    if not last_doc_batch_was_reported and num_batches > 0:
+    if not last_doc_batch_was_reported and (num_batches > 0 or cached_doc_count > 0):
         # 打印最终document性能报告
         print_performance_report(
-            performance_log, final_doc_processed, len(data), "document", model, cumulative_stats
+            performance_log, final_doc_processed, len(document_list), "document", model, cumulative_stats
         )
         # 保存检查点
         save_checkpoint_with_results(
             output_file, checkpoint, results,
             final_query_processed,
             final_doc_processed,
-            performance_log, cumulative_stats, query_vector_cache, verbose=True
+            performance_log, cumulative_stats, query_vector_cache, document_vector_cache, verbose=True
         )
 
     print(f"✅ Document向量处理完成，总API调用时间: {doc_api_time_total:.2f}s, "
-          f"总Token: {doc_total_tokens:,}\n")
+          f"总Token: {doc_total_tokens:,}, "
+          f"实际调用: {len(uncached_unique_documents)} 条唯一document\n")
 
-    # 验证结果完整性
-    if len(results) != len(data):
-        print(f"⚠️  警告: 结果数量 ({len(results)}) 与数据数量 ({len(data)}) 不匹配")
-        # 补齐缺失的结果
-        for i in range(len(results), len(data)):
-            results.append({
-                "query": data[i].get("query", ""),
-                "document": data[i].get("document", ""),
-                "query_vector": None,
-                "document_vector": None,
-                "score": data[i].get("score")
-            })
+    # 构建输出向量列表（按原始顺序）
+    query_vectors = []
+    document_vectors = []
+
+    if data_format == "new":
+        # 新格式：直接按顺序构建向量列表
+        for query in query_list:
+            query_vectors.append(query_vector_cache.get(query))
+        for document in document_list:
+            document_vectors.append(document_vector_cache.get(document))
+    else:
+        # 旧格式：从 results 中提取
+        for item in data:
+            query = item.get("query", "")
+            document = item.get("document", "")
+            query_vectors.append(query_vector_cache.get(query))
+            document_vectors.append(document_vector_cache.get(document))
 
     # 计算总体性能统计
     total_api_time = query_api_time_total + doc_api_time_total
     final_total_tokens = cumulative_stats["total_tokens"]
     final_total_cost = cumulative_stats["total_cost"]
 
+    total_query_count = len(query_list)
+    total_doc_count = len(document_list)
+
     performance_summary = {
-        "total_items": len(data) * 2,  # query + document
-        "query_items": len(data),
-        "document_items": len(data),
+        "total_items": total_query_count + total_doc_count,
+        "query_items": total_query_count,
+        "document_items": total_doc_count,
         "total_api_time_seconds": round(total_api_time, 2),
         "query_api_time_seconds": round(query_api_time_total, 2),
         "document_api_time_seconds": round(doc_api_time_total, 2),
-        "items_per_second": round(len(data) * 2 / total_api_time, 2) if total_api_time > 0 else 0,
+        "items_per_second": round((total_query_count + total_doc_count) / total_api_time, 2) if total_api_time > 0 else 0,
         "token_usage": {
             "total_prompt_tokens": cumulative_stats["query_prompt_tokens"] + cumulative_stats["document_prompt_tokens"],
             "total_tokens": final_total_tokens,
@@ -774,7 +819,7 @@ def process_qa_data(
             "query_total_tokens": cumulative_stats["query_total_tokens"],
             "document_prompt_tokens": cumulative_stats["document_prompt_tokens"],
             "document_total_tokens": cumulative_stats["document_total_tokens"],
-            "avg_tokens_per_item": round(final_total_tokens / len(data) / 2, 2) if len(data) > 0 else 0
+            "avg_tokens_per_item": round(final_total_tokens / (total_query_count + total_doc_count), 2) if (total_query_count + total_doc_count) > 0 else 0
         },
         "cost": {
             "total_cost_usd": round(final_total_cost, 4),
@@ -789,16 +834,19 @@ def process_qa_data(
 
     # 保存最终结果
     print("💾 正在保存结果...")
+    vector_dimension = len(query_vectors[0]) if query_vectors and query_vectors[0] else (len(document_vectors[0]) if document_vectors and document_vectors[0] else 0)
+
     final_output = {
         "metadata": {
             "input_file": input_file,
             "model": model,
-            "total_items": len(data),
-            "processed_items": len(results),
-            "vector_dimension": len(results[0]["query_vector"]) if results and results[0].get("query_vector") else 0,
+            "query_count": total_query_count,
+            "document_count": total_doc_count,
+            "vector_dimension": vector_dimension,
             "performance": performance_summary
         },
-        "results": results,
+        "query_vectors": query_vectors,
+        "document_vectors": document_vectors,
         "performance_log": performance_log
     }
 
@@ -817,15 +865,15 @@ def process_qa_data(
     print("\n" + "=" * 60)
     print("最终性能统计（仅API调用时间）")
     print("=" * 60)
-    print(f"总处理项数: {len(data)} (query: {len(data)}, document: {len(data)})")
+    print(f"总处理项数: {total_query_count + total_doc_count} (query: {total_query_count}, document: {total_doc_count})")
     print(f"总API调用时间: {total_api_time:.2f}s")
     print(f"  - Query API调用: {query_api_time_total:.2f}s")
     print(f"  - Document API调用: {doc_api_time_total:.2f}s")
     print(f"处理速度: {performance_summary['items_per_second']:.2f} 项/秒")
-    if len(data) > 0:
-        avg_time_per_item = total_api_time / len(data)
-        avg_query_time = query_api_time_total / len(data)
-        avg_doc_time = doc_api_time_total / len(data)
+    if total_query_count + total_doc_count > 0:
+        avg_time_per_item = total_api_time / (total_query_count + total_doc_count)
+        avg_query_time = query_api_time_total / total_query_count if total_query_count > 0 else 0
+        avg_doc_time = doc_api_time_total / total_doc_count if total_doc_count > 0 else 0
         print(f"\n平均每条数据耗时:")
         print(f"  总耗时: {avg_time_per_item:.4f}s/条")
         print(f"  - Query耗时: {avg_query_time:.4f}s/条")
@@ -842,7 +890,7 @@ def process_qa_data(
     print(f"  总费用: ${final_total_cost:.4f}")
     print(f"  - Query费用: ${performance_summary['cost']['query_cost_usd']:.4f}")
     print(f"  - Document费用: ${performance_summary['cost']['document_cost_usd']:.4f}")
-    print(f"\n向量维度: {len(results[0]['query_vector']) if results and results[0].get('query_vector') else 0}")
+    print(f"\n向量维度: {vector_dimension}")
     print("=" * 60)
 
 

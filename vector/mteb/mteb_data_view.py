@@ -4,20 +4,20 @@
 
 使用方法:
     # 使用默认的小数据集 (nfcorpus) - 会自动使用缓存
-    python vector/mteb_data_view.py
+    python vector/mteb/mteb_data_view.py
 
     # 指定数据集
-    python vector/mteb_data_view.py nfcorpus
-    python vector/mteb_data_view.py scidocs
+    python vector/mteb/mteb_data_view.py nfcorpus
+    python vector/mteb/mteb_data_view.py scidocs
 
     # 保存到本地以便下次更快加载（推荐）
-    python vector/mteb_data_view.py nfcorpus --save-local
+    python vector/mteb/mteb_data_view.py nfcorpus --save-local
 
     # 强制重新下载（忽略缓存）
-    python vector/mteb_data_view.py nfcorpus --force-download
+    python vector/mteb/mteb_data_view.py nfcorpus --force-download
 
     # 查看所有可用数据集
-    python vector/mteb_data_view.py --list
+    python vector/mteb/mteb_data_view.py --list
 
 缓存说明:
     - datasets 库默认会缓存下载的数据集到 ~/.cache/huggingface/datasets
@@ -239,48 +239,50 @@ def view_dataset_data(dataset_name: str = "mteb/nfcorpus", use_cache: bool = Tru
 
     # 检查是否有本地保存的数据集
     local_path = f".data/{dataset_name.replace('/', '_')}"
+    dataset = None
     if os.path.exists(local_path) and use_cache:
         print(f"\n📂 发现本地保存的数据集: {local_path}")
         print("   正在从本地加载（最快）...")
         try:
             dataset = load_from_disk(local_path)
             print("✅ 成功从本地加载数据集")
-            corpus = None  # 本地加载时暂时不加载corpus
-            return dataset, corpus
         except Exception as e:
             print(f"⚠️  本地加载失败: {e}，将尝试从网络加载")
+            dataset = None
 
-    # 加载数据集 - 尝试不同的配置
-    print("\n正在加载数据集...")
-    try:
-        # 如果设置了use_cache=False，可以通过设置download_mode控制
-        download_mode = None if use_cache else "force_redownload"
-        dataset = load_dataset(dataset_name, download_mode=download_mode)
-        print("✅ 数据集加载成功")
-
-        # 如果启用保存本地，保存数据集
-        if save_local:
-            os.makedirs(local_path, exist_ok=True)
-            print(f"\n💾 正在保存数据集到本地: {local_path}")
-            dataset.save_to_disk(local_path)
-            print("✅ 数据集已保存到本地，下次运行将更快加载")
-
-    except Exception as e:
-        print(f"⚠️  加载失败: {e}")
-        # 尝试查看可用配置
+    # 如果本地加载失败或未找到，从网络加载
+    if dataset is None:
+        # 加载数据集 - 尝试不同的配置
+        print("\n正在从网络加载数据集...")
         try:
-            from datasets import get_dataset_config_names
-            configs = get_dataset_config_names(dataset_name)
-            print(f"📋 可用的配置: {configs}")
-            if configs:
-                download_mode = None if use_cache else "force_redownload"
-                dataset = load_dataset(dataset_name, configs[0], download_mode=download_mode)
-                print(f"✅ 使用配置: {configs[0]}")
-                if save_local:
-                    os.makedirs(local_path, exist_ok=True)
-                    dataset.save_to_disk(local_path)
-        except:
-            raise
+            # 如果设置了use_cache=False，可以通过设置download_mode控制
+            download_mode = None if use_cache else "force_redownload"
+            dataset = load_dataset(dataset_name, download_mode=download_mode)
+            print("✅ 数据集加载成功")
+
+            # 如果启用保存本地，保存数据集
+            if save_local:
+                os.makedirs(local_path, exist_ok=True)
+                print(f"\n💾 正在保存数据集到本地: {local_path}")
+                dataset.save_to_disk(local_path)
+                print("✅ 数据集已保存到本地，下次运行将更快加载")
+
+        except Exception as e:
+            print(f"⚠️  加载失败: {e}")
+            # 尝试查看可用配置
+            try:
+                from datasets import get_dataset_config_names
+                configs = get_dataset_config_names(dataset_name)
+                print(f"📋 可用的配置: {configs}")
+                if configs:
+                    download_mode = None if use_cache else "force_redownload"
+                    dataset = load_dataset(dataset_name, configs[0], download_mode=download_mode)
+                    print(f"✅ 使用配置: {configs[0]}")
+                    if save_local:
+                        os.makedirs(local_path, exist_ok=True)
+                        dataset.save_to_disk(local_path)
+            except:
+                raise
 
     # 尝试加载文档集合
     print("\n正在尝试加载文档集合...")
@@ -336,10 +338,19 @@ def view_dataset_data(dataset_name: str = "mteb/nfcorpus", use_cache: bool = Tru
 
     # 查看完整样本（第一个）
     print("\n" + "=" * 60)
-    print("完整样本示例 (train 拆分第一个样本):")
-    print("=" * 60)
-    if "train" in dataset and len(dataset["train"]) > 0:
-        first_example = dataset["train"][0]
+    # 尝试找到第一个可用的拆分
+    first_split_name = None
+    first_split_data = None
+    for split_name in dataset.keys():
+        if len(dataset[split_name]) > 0:
+            first_split_name = split_name
+            first_split_data = dataset[split_name]
+            break
+
+    if first_split_name:
+        print(f"完整样本示例 ({first_split_name} 拆分第一个样本):")
+        print("=" * 60)
+        first_example = first_split_data[0]
         print(f"\n完整样本内容:")
         for key, value in first_example.items():
             print(f"\n{key}:")
@@ -352,7 +363,15 @@ def view_dataset_data(dataset_name: str = "mteb/nfcorpus", use_cache: bool = Tru
                 else:
                     print(f"  {value}")
             else:
-                print(f"  {value}")
+                # 如果是长文本，截断显示
+                if isinstance(value, str) and len(value) > 500:
+                    print(f"  {value[:500]}...")
+                else:
+                    print(f"  {value}")
+    else:
+        print("完整样本示例:")
+        print("=" * 60)
+        print("⚠️  数据集中没有可用的拆分或拆分为空")
 
     return dataset, corpus
 
@@ -387,29 +406,26 @@ if __name__ == "__main__":
                 use_cache = False
             elif arg in ["--no-cache"]:
                 use_cache = False
-            elif arg not in SMALL_DATASETS:
+            elif not arg.startswith("--") and not arg.startswith("-"):
                 # 如果不是选项，可能是数据集名称
-                if not arg.startswith("--") and not arg.startswith("-"):
-                    dataset_key = arg.lower()
-                    if dataset_key not in SMALL_DATASETS:
-                        print(f"❌ 未知的数据集: {dataset_key}")
-                        print("\n可用的数据集:")
-                        for key in SMALL_DATASETS.keys():
-                            print(f"  - {key}")
-                        print("\n使用 --list 查看详细信息")
-                        print("\n可用选项:")
-                        print("  --save-local, -s    保存数据集到本地以便更快加载")
-                        print("  --force-download, -f 强制重新下载（忽略缓存）")
-                        print("  --no-cache          不使用缓存")
-                        sys.exit(1)
+                dataset_key = arg.lower()
 
     # 获取数据集信息
-    dataset_info = SMALL_DATASETS[dataset_key]
-    dataset_name = dataset_info["name"]
-
-    print(f"\n📦 使用数据集: {dataset_key}")
-    print(f"   {dataset_info['description']}")
-    print(f"   大小: {dataset_info['size']}")
+    if dataset_key in SMALL_DATASETS:
+        # 使用白名单中的数据集信息
+        dataset_info = SMALL_DATASETS[dataset_key]
+        dataset_name = dataset_info["name"]
+        print(f"\n📦 使用数据集: {dataset_key}")
+        print(f"   {dataset_info['description']}")
+        print(f"   大小: {dataset_info['size']}")
+    else:
+        # 使用用户指定的数据集名称（自动添加 mteb/ 前缀如果不存在）
+        if dataset_key.startswith("mteb/"):
+            dataset_name = dataset_key
+        else:
+            dataset_name = f"mteb/{dataset_key}"
+        print(f"\n📦 使用数据集: {dataset_name}")
+        print(f"   (用户指定的数据集，不在推荐列表中)")
     if save_local:
         print("   💾 将保存到本地以便下次快速加载")
     if force_download:
@@ -423,14 +439,18 @@ if __name__ == "__main__":
     print("数据统计:")
     print("=" * 60)
 
-    if "train" in dataset:
-        train_data = dataset["train"]
-        print(f"\n训练集统计:")
-        print(f"  - 总样本数: {len(train_data)}")
+    # 显示所有拆分的统计信息
+    for split_name in dataset.keys():
+        split_data = dataset[split_name]
+        if len(split_data) == 0:
+            continue
+
+        print(f"\n{split_name.upper()} 拆分统计:")
+        print(f"  - 总样本数: {len(split_data)}")
 
         # 计算平均查询长度（如果存在 query 字段）
-        if len(train_data) > 0:
-            first_item = train_data[0]
+        if len(split_data) > 0:
+            first_item = split_data[0]
             # 尝试找到包含查询文本的字段
             query_field = None
             for key in first_item.keys():
@@ -439,7 +459,8 @@ if __name__ == "__main__":
                     break
 
             if query_field:
-                query_lengths = [len(str(item[query_field])) for item in train_data.select(range(min(1000, len(train_data))))]
+                sample_size = min(1000, len(split_data))
+                query_lengths = [len(str(item[query_field])) for item in split_data.select(range(sample_size))]
                 avg_query_len = sum(query_lengths) / len(query_lengths) if query_lengths else 0
-                print(f"  - 平均{query_field}长度 (前1000个样本): {avg_query_len:.1f} 字符")
+                print(f"  - 平均{query_field}长度 (前{sample_size}个样本): {avg_query_len:.1f} 字符")
 
