@@ -1,7 +1,7 @@
 """
-Milvus向量数据库评测脚本
+Chroma向量数据库评测脚本
 
-根据spec.md的要求，对Milvus进行向量检索评测：
+根据spec.md的要求，对Chroma进行向量检索评测：
 - 基于向量化评测生成的q-d向量
 - 所有document向量全部入库后再开始评测
 - 评测基准：基于暴力法算出来的top-N最近邻向量
@@ -10,8 +10,8 @@ Milvus向量数据库评测脚本
   - 处理能力：记录每个请求的时间，并报告最终的时间分布（最大最小、平均、分位数）
 
 使用方法:
-    python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json
-    python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_gemini_vectors.json -n 10
+    python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_openai_vectors.json
+    python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_gemini_vectors.json -n 10
 """
 import os
 import json
@@ -20,75 +20,56 @@ import argparse
 import hashlib
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
-from collections import defaultdict
-from pymilvus import (
-    connections,
-    utility,
-    FieldSchema,
-    CollectionSchema,
-    DataType,
-    Collection,
-    MilvusException
-)
+from chromadb import CloudClient
 
 
 # ==================== 工具函数 ====================
 
-def get_milvus_client():
-    """获取Milvus客户端连接"""
-    cluster_endpoint = os.getenv("MILVUS_CLUSTER_ENDPOINT")
-    token = os.getenv("MILUVS_TOKEN") or os.getenv("MILVUS_TOKEN")  # 兼容拼写错误
+def get_chroma_client():
+    """获取Chroma客户端连接（Cloud模式）"""
+    api_key = os.getenv("CHROMA_API_KEY")
+    tenant = os.getenv("CHROMA_TENANT")
+    database = os.getenv("CHROMA_DATABASE")
 
-    if not cluster_endpoint:
-        raise ValueError("请设置 MILVUS_CLUSTER_ENDPOINT 环境变量")
-    if not token:
-        raise ValueError("请设置 MILVUS_TOKEN 或 MILUVS_TOKEN 环境变量")
+    if not api_key:
+        raise ValueError("请设置 CHROMA_API_KEY 环境变量")
+    if not tenant:
+        raise ValueError("请设置 CHROMA_TENANT 环境变量")
+    if not database:
+        raise ValueError("请设置 CHROMA_DATABASE 环境变量")
 
-    connections.connect(
-        alias="default",
-        uri=cluster_endpoint,
-        token=token
-    )
-    return connections.get_connection_addr("default")
+    # 创建Chroma Cloud客户端
+    # 根据Chroma Cloud官方文档：https://docs.trychroma.com/docs/run-chroma/cloud-client
+    # 使用CloudClient创建客户端
+    try:
+        client = CloudClient(
+            tenant=tenant,
+            database=database,
+            api_key=api_key
+        )
+        print(f"✅ Chroma Cloud客户端创建成功")
+        print(f"   Tenant: {tenant}")
+        print(f"   Database: {database}")
+    except Exception as e:
+        error_msg = str(e)
+        if "Permission denied" in error_msg or "permission" in error_msg.lower():
+            raise ValueError(
+                f"Chroma Cloud连接权限被拒绝。请检查：\n"
+                f"  1. API密钥是否正确 (CHROMA_API_KEY)\n"
+                f"  2. Tenant是否正确 (CHROMA_TENANT={tenant})\n"
+                f"  3. Database是否正确 (CHROMA_DATABASE={database})\n"
+                f"  4. API密钥是否有访问该tenant和database的权限\n"
+                f"原始错误: {e}"
+            )
+        else:
+            raise ValueError(f"创建Chroma Cloud客户端失败: {e}")
+
+    return client
 
 
 def compute_sha512_hex(text: str) -> str:
     """计算文本的SHA-512哈希值（十六进制字符串）"""
     return hashlib.sha512(text.encode('utf-8')).hexdigest()
-
-
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """计算两个向量的余弦相似度"""
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-    dot_product = np.dot(vec1, vec2)
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return float(dot_product / (norm1 * norm2))
-
-
-def brute_force_top_n(
-    query_vec: List[float],
-    doc_vectors: List[List[float]],
-    doc_ids: List[str],
-    top_n: int
-) -> List[Tuple[str, float]]:
-    """
-    使用暴力法计算top-N最近邻向量
-
-    Returns:
-        List of (doc_id, similarity_score) tuples, sorted by similarity descending
-    """
-    similarities = []
-    for doc_id, doc_vec in zip(doc_ids, doc_vectors):
-        sim = cosine_similarity(query_vec, doc_vec)
-        similarities.append((doc_id, sim))
-
-    # 按相似度降序排序
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    return similarities[:top_n]
 
 
 # ==================== 数据加载 ====================
@@ -362,185 +343,212 @@ def extract_query_document_vectors(
     return queries, documents
 
 
-# ==================== Milvus操作 ====================
+# ==================== Chroma操作 ====================
 
-def create_collection(collection_name: str, dimension: int, force_recreate: bool = False) -> Tuple[Collection, bool]:
+def create_collection(client, collection_name: str, dimension: int, force_recreate: bool = False):
     """
-    创建或获取Milvus collection
+    创建或获取Chroma collection
 
     Args:
+        client: Chroma客户端
         collection_name: collection名称
-        dimension: 向量维度
+        dimension: 向量维度（Chroma会自动推断，但我们可以验证）
         force_recreate: 是否强制重新创建（删除已存在的collection）
 
     Returns:
         (Collection对象, 是否是新创建的)
     """
     # 检查collection是否已存在
-    if utility.has_collection(collection_name):
+    try:
+        existing_collection = client.get_collection(collection_name)
         if force_recreate:
             print(f"⚠️  Collection '{collection_name}' 已存在，强制删除旧collection...")
-            collection = Collection(collection_name)
-            collection.drop()
+            client.delete_collection(collection_name)
         else:
             print(f"✅ Collection '{collection_name}' 已存在，复用现有collection")
-            collection = Collection(collection_name)
-            # 检查collection是否有索引
-            try:
-                indexes = collection.indexes
-                if not indexes:
-                    print(f"   正在创建索引...")
-                    index_params = {
-                        "metric_type": "COSINE",
-                        "index_type": "IVF_FLAT",
-                        "params": {"nlist": 1024}
-                    }
-                    collection.create_index("vector", index_params)
-            except Exception:
-                # 如果检查索引失败，尝试创建
-                print(f"   正在创建索引...")
-                index_params = {
-                    "metric_type": "COSINE",
-                    "index_type": "IVF_FLAT",
-                    "params": {"nlist": 1024}
-                }
-                collection.create_index("vector", index_params)
+            # 验证维度
+            metadata = existing_collection.metadata or {}
+            existing_dim = metadata.get('dimension')
+            if existing_dim and existing_dim != dimension:
+                print(f"⚠️  警告: 现有collection的维度 ({existing_dim}) 与预期维度 ({dimension}) 不匹配")
+            return existing_collection, False
+    except Exception:
+        # Collection不存在，继续创建
+        pass
 
-            # 确保collection已加载到内存
-            try:
-                collection.load()
-            except Exception:
-                pass  # 如果已加载会抛出异常，忽略
-            return collection, False
-
-    # 定义schema
-    fields = [
-        FieldSchema(name="primary_key", dtype=DataType.VARCHAR, max_length=1024, is_primary=True),
-        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension)
-    ]
-
-    schema = CollectionSchema(fields, description=f"Vector collection for {collection_name}")
-
-    # 创建collection
-    collection = Collection(collection_name, schema)
-
-    # 创建索引
-    index_params = {
-        "metric_type": "COSINE",
-        "index_type": "IVF_FLAT",
-        "params": {"nlist": 1024}
-    }
-    collection.create_index("vector", index_params)
+    # 创建新collection
+    # Chroma会自动推断向量维度，但我们可以在metadata中存储
+    collection = client.create_collection(
+        name=collection_name,
+        metadata={"dimension": dimension}
+    )
 
     print(f"✅ 已创建collection: {collection_name}")
     print(f"   维度: {dimension}")
-    print(f"   索引类型: IVF_FLAT")
 
     return collection, True
 
 
-def check_collection_data(collection: Collection, expected_count: int) -> bool:
+def check_collection_data(collection, expected_count: int) -> bool:
     """
     检查collection中的数据量是否匹配预期
 
     Args:
-        collection: Milvus collection对象
+        collection: Chroma collection对象
         expected_count: 预期的数据量
 
     Returns:
         是否匹配
     """
     try:
-        # 获取collection的实体数量
-        num_entities = collection.num_entities
-        return num_entities == expected_count
+        # 获取collection的count
+        count = collection.count()
+        return count == expected_count
     except Exception as e:
         print(f"   ⚠️  检查collection数据量时出错: {e}")
         return False
 
 
-def insert_documents(collection: Collection, documents: List[Dict[str, Any]], batch_size: int = 1000, skip_if_exists: bool = True):
+def insert_documents(collection, documents: List[Dict[str, Any]], batch_size: int = 100, skip_if_exists: bool = True):
     """
-    插入document向量到Milvus
+    插入document向量到Chroma
 
     Args:
-        collection: Milvus collection对象
+        collection: Chroma collection对象
         documents: document列表，每个包含hash和vector
         batch_size: 批量插入大小
         skip_if_exists: 如果collection中已有数据，是否跳过插入
     """
     # 检查是否已有数据
     if skip_if_exists:
-        expected_count = len(documents)
-        if check_collection_data(collection, expected_count):
-            print(f"✅ Collection中已有 {expected_count} 条数据，跳过插入")
-            # 确保collection已加载到内存
-            try:
-                collection.load()
-            except Exception:
-                pass  # 如果已加载会抛出异常，忽略
-            return
+        try:
+            current_count = collection.count()
+            expected_count = len(documents)
+            print(f"📊 Collection当前数据量: {current_count}，预期插入: {expected_count}")
+
+            if current_count >= expected_count:
+                print(f"✅ Collection中已有 {current_count} 条数据（预期 {expected_count} 条），跳过插入")
+                return
+            elif current_count > 0:
+                print(f"⚠️  Collection中已有 {current_count} 条数据，但预期 {expected_count} 条")
+                print(f"   检查哪些数据已存在...")
+
+                # 分批检查已存在的ID，避免一次性查询太多
+                all_ids = [doc['hash'] for doc in documents]
+                existing_ids = set()
+                check_batch_size = 100  # 每次检查100个ID
+
+                for i in range(0, len(all_ids), check_batch_size):
+                    batch_ids = all_ids[i:i + check_batch_size]
+                    try:
+                        existing_results = collection.get(ids=batch_ids)
+                        batch_existing = existing_results.get('ids', [])
+                        existing_ids.update(batch_existing)
+                    except Exception as e:
+                        # 如果检查失败，保守处理：假设这些ID已存在，避免重复插入
+                        print(f"   ⚠️  检查批次 {i//check_batch_size + 1} 时出错: {e}")
+                        print(f"   保守处理：假设这些ID已存在，跳过插入")
+                        existing_ids.update(batch_ids)
+
+                # 过滤出需要插入的数据
+                documents = [doc for doc in documents if doc['hash'] not in existing_ids]
+
+                if not documents:
+                    print(f"✅ 所有数据已存在，跳过插入")
+                    return
+
+                print(f"   实际需要插入 {len(documents)} 条新数据（已存在 {len(existing_ids)} 条）")
+        except Exception as e:
+            print(f"   ⚠️  检查collection数据量时出错: {e}")
+            print(f"   ⚠️  为避免配额超限，将跳过插入。如需强制插入，请使用 --force-recreate")
+            # 如果检查失败，为了安全起见，不插入数据
+            raise ValueError(
+                f"无法检查collection数据状态，为避免配额超限已跳过插入。\n"
+                f"如果确定需要插入，请使用 --force-recreate 参数强制重建collection。\n"
+                f"原始错误: {e}"
+            )
 
     print(f"📥 开始插入 {len(documents)} 个document向量...")
 
-    primary_keys = [doc['hash'] for doc in documents]
-    vectors = [doc['vector'] for doc in documents]
+    ids = [doc['hash'] for doc in documents]
+    embeddings = [doc['vector'] for doc in documents]
+    # Chroma需要metadatas，我们可以存储document文本（可选）
+    metadatas = [{"text": doc['document'][:1000]} for doc in documents]  # 限制长度
 
     # 批量插入
     total_batches = (len(documents) + batch_size - 1) // batch_size
+    inserted_count = 0
+
     for i in range(0, len(documents), batch_size):
-        batch_keys = primary_keys[i:i + batch_size]
-        batch_vectors = vectors[i:i + batch_size]
+        batch_ids = ids[i:i + batch_size]
+        batch_embeddings = embeddings[i:i + batch_size]
+        batch_metadatas = metadatas[i:i + batch_size]
 
         batch_num = i // batch_size + 1
-        print(f"   插入批次 {batch_num}/{total_batches} ({len(batch_keys)} 条)...", end='\r')
+        print(f"   插入批次 {batch_num}/{total_batches} ({len(batch_ids)} 条)...", end='\r')
 
-        collection.insert([batch_keys, batch_vectors])
+        try:
+            collection.add(
+                ids=batch_ids,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas
+            )
+            inserted_count += len(batch_ids)
+        except Exception as e:
+            error_msg = str(e)
+            if "Quota exceeded" in error_msg or "quota" in error_msg.lower():
+                print(f"\n❌ Chroma Cloud配额超限错误:")
+                print(f"   {error_msg}")
+                print(f"\n📊 插入进度: 已成功插入 {inserted_count}/{len(documents)} 条数据")
+                print(f"\n💡 解决方案:")
+                print(f"   1. 当前collection可能已有数据，请检查并考虑使用 --force-recreate 强制重建")
+                print(f"   2. 联系Chroma Cloud申请增加配额（错误信息中包含申请链接）")
+                print(f"   3. 使用较小的数据集进行测试")
+                print(f"   4. 如果数据已部分插入，可以继续运行脚本，脚本会跳过已存在的数据")
+                raise ValueError(f"Chroma Cloud配额超限: {error_msg}")
+            else:
+                # 其他错误继续抛出
+                raise
 
-    # 刷新数据，确保可搜索
-    collection.flush()
-    print(f"\n✅ 已插入 {len(documents)} 个document向量")
-
-    # 加载collection到内存
-    collection.load()
-    print("✅ Collection已加载到内存")
+    print(f"\n✅ 已插入 {inserted_count} 个document向量")
 
 
 def search_vectors(
-    collection: Collection,
+    collection,
     query_vectors: List[List[float]],
     top_k: int
 ) -> List[List[Dict[str, Any]]]:
     """
-    在Milvus中搜索向量
+    在Chroma中搜索向量
 
     Args:
-        collection: Milvus collection对象
+        collection: Chroma collection对象
         query_vectors: 查询向量列表
         top_k: 返回top-k结果
 
     Returns:
         每个query的搜索结果列表
     """
-    search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
-
-    results = collection.search(
-        data=query_vectors,
-        anns_field="vector",
-        param=search_params,
-        limit=top_k,
-        output_fields=[]
+    # Chroma支持批量查询
+    results = collection.query(
+        query_embeddings=query_vectors,
+        n_results=top_k
     )
 
     # 转换结果格式
     formatted_results = []
-    for result in results:
+    # results的结构: {'ids': [[id1, id2, ...], ...], 'distances': [[dist1, dist2, ...], ...], ...}
+    num_queries = len(query_vectors)
+    for i in range(num_queries):
         hits = []
-        for hit in result:
+        query_ids = results['ids'][i] if i < len(results['ids']) else []
+        query_distances = results['distances'][i] if i < len(results['distances']) else []
+
+        for doc_id, distance in zip(query_ids, query_distances):
             hits.append({
-                'id': hit.id,
-                'distance': hit.distance,
-                'score': hit.score if hasattr(hit, 'score') else hit.distance
+                'id': doc_id,
+                'distance': float(distance),
+                'score': float(distance)  # Chroma使用距离，我们也可以转换为相似度
             })
         formatted_results.append(hits)
 
@@ -658,15 +666,17 @@ def run_benchmark(
     force_recreate: bool = False
 ):
     """
-    运行Milvus评测
+    运行Chroma评测
 
     Args:
         vector_file: 向量数据文件路径
         top_n: top-N检索数量
         collection_name: collection名称（如果为None，则根据模型自动生成）
+        ground_truth_file: 预计算的基准结果文件路径
+        force_recreate: 是否强制重新创建collection
     """
     print("=" * 80)
-    print("🚀 Milvus向量数据库评测")
+    print("🚀 Chroma向量数据库评测")
     print("=" * 80)
 
     # 1. 加载数据
@@ -723,14 +733,14 @@ def run_benchmark(
     documents = list(unique_docs.values())
     print(f"📊 去重后Document数量: {len(documents)}")
 
-    # 2. 连接Milvus
+    # 2. 连接Chroma
     print("\n" + "=" * 80)
-    print("🔌 连接Milvus...")
+    print("🔌 连接Chroma...")
     try:
-        get_milvus_client()
-        print("✅ Milvus连接成功")
+        client = get_chroma_client()
+        print("✅ Chroma连接成功")
     except Exception as e:
-        print(f"❌ Milvus连接失败: {e}")
+        print(f"❌ Chroma连接失败: {e}")
         return
 
     # 3. 创建collection
@@ -743,7 +753,7 @@ def run_benchmark(
 
     # 获取向量维度
     dimension = len(documents[0]['vector'])
-    collection, is_new_collection = create_collection(collection_name, dimension, force_recreate)
+    collection, is_new_collection = create_collection(client, collection_name, dimension, force_recreate)
 
     # 4. 插入所有document向量（如果是新collection或强制重建，则插入；否则检查是否已有数据）
     print("\n" + "=" * 80)
@@ -895,7 +905,7 @@ def run_benchmark(
         'search_times': [float(t) for t in search_times]
     }
 
-    output_file = vector_file.replace('.json', '_milvus_benchmark_results.json')
+    output_file = vector_file.replace('.json', '_chroma_benchmark_results.json')
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
@@ -906,24 +916,29 @@ def run_benchmark(
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="Milvus向量数据库评测脚本",
+        description="Chroma向量数据库评测脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   # 基本使用（自动从.data/vector_search目录加载基准文件）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json
+  python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_openai_vectors.json
 
   # 指定基准文件路径（如果不在默认位置）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -g path/to/benchmark.json
+  python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -g path/to/benchmark.json
 
   # 指定top-N（会自动从基准文件读取，如果基准文件的top_n不同会给出警告）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_gemini_vectors.json -n 20
+  python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_gemini_vectors.json -n 20
 
   # 指定collection名称
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -c my_collection
+  python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_openai_vectors.json -c my_collection
 
   # 强制重新创建collection（删除已存在的并重新插入数据）
-  python vector/vector_db/milvus_benchmark.py -i .data/vectors/scidocs_openai_vectors.json --force-recreate
+  python vector/vector_db/chroma_benchmark.py -i .data/vectors/scidocs_openai_vectors.json --force-recreate
+
+环境变量:
+  - CHROMA_API_KEY: Chroma Cloud API密钥
+  - CHROMA_TENANT: Chroma Cloud租户名称
+  - CHROMA_DATABASE: Chroma Cloud数据库名称
 
 注意:
   - 基准文件会自动从.data/vector_search目录查找（优先）

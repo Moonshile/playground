@@ -29,3 +29,10 @@
     - vector: 向量，类型是 FLOAT_VECTOR，建索引
 - 插入数据 [https://docs.zilliz.com/docs/quick-start#create-collection]
 - 检索数据 [https://docs.zilliz.com/docs/quick-start#similarity-search]
+
+### Chroma
+
+- 创建 cloud client [https://docs.trychroma.com/docs/run-chroma/cloud-client]
+  - API key、tenant、database都从环境变量中读取
+  - 环境变量名：CHROMA_API_KEY、CHROMA_TENANT、CHROMA_DATABASE
+- 创建 collection、添加数据、检索数据 [https://docs.trychroma.com/docs/overview/getting-started]
